@@ -440,7 +440,7 @@ def process_invoice(pdf_io, master_site_names):
     }
 
 
-st.title("PDF Invoice Parser")
+st.title("APS INVOICE DATA EXTRACTION")
 
 pdf_file = st.file_uploader("Upload PDF Invoice", type=["pdf"])
 csv_file = st.file_uploader("Upload Master Sites CSV", type=["csv"])
