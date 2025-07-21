@@ -4,7 +4,6 @@ import pdfplumber
 import pandas as pd
 from rapidfuzz import process, fuzz
 import ipywidgets as widgets
-from IPython.display import display
 
 # --- Widgets for file upload and process ---
 pdf_upload = widgets.FileUpload(accept=".pdf", multiple=False)
