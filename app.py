@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 import pdfplumber
-from aps import extract_service_lines
+from parser import extract_service_lines
 
 st.set_page_config(page_title="Invoice Parser", layout="centered")
 st.title("📄 Automated Invoice PDF Parser")
