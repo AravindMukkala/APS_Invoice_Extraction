@@ -4,15 +4,6 @@ import pdfplumber
 import pandas as pd
 from rapidfuzz import process, fuzz
 
-# --- Widgets for file upload and process ---
-pdf_upload = widgets.FileUpload(accept=".pdf", multiple=False)
-csv_upload = widgets.FileUpload(accept=".csv", multiple=False)
-process_button = widgets.Button(description="Process Uploaded Files")
-output = widgets.Output()
-
-display(widgets.Label("Upload PDF Invoice:"), pdf_upload)
-display(widgets.Label("Upload Master Sites CSV:"), csv_upload)
-display(process_button, output)
 
 # --- Site name corrections cache ---
 site_name_corrections = {}
