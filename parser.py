@@ -527,4 +527,3 @@ def on_process_button_clicked(b):
         with output:
             print(f"Error during processing: {e}")
 
-process_button.on_click(on_process_button_clicked)
