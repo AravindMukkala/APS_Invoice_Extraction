@@ -302,8 +302,8 @@ def process_pdf(file_stream):
 # -----------------------------
 # Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="OPAL Invoice PDF → Excel", layout="wide")
-st.title("📄 Invoice PDF → Excel Extractor")
+st.set_page_config(page_title="Invoice PDF → Excel", layout="wide")
+st.title("📄 OPAL Invoice PDF → Excel Extractor")
 
 uploaded_file = st.file_uploader("Upload an Invoice PDF", type=["pdf"])
 
