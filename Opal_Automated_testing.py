@@ -6,16 +6,23 @@ import json
 import streamlit as st
 
 # -----------------------------
-# Load learned patterns if available
+# Load learned patterns
 # -----------------------------
-try:
-    with open("learned_patterns.json", "r") as f:
-        learned_patterns = json.load(f)
-except FileNotFoundError:
-    learned_patterns = {}
+def load_learned_patterns():
+    try:
+        with open("learned_patterns.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_learned_patterns(patterns):
+    with open("learned_patterns.json", "w") as f:
+        json.dump(patterns, f, indent=2)
+
+learned_patterns = load_learned_patterns()
 
 # -----------------------------
-# Tokenizer (for auto-learned regex)
+# Tokenizer
 # -----------------------------
 def tokenize_line(line):
     tokens = line.split()
@@ -26,6 +33,8 @@ def tokenize_line(line):
         else "<TEXT>"
         for t in tokens
     ])
+
+
 
 # -----------------------------
 # Main PDF Processing
@@ -275,6 +284,57 @@ def process_pdf(file_stream):
 
     return invoice_no, data, missed_lines, totals
 
+
+# -----------------------------
+# Learning widget
+# -----------------------------
+def show_learning_widget(unmatched_lines):
+    st.subheader("🧠 Learn New Pattern")
+    if not unmatched_lines:
+        st.info("No unmatched lines available for training.")
+        return
+
+    # Select a line
+    selected_line = st.selectbox(
+        "Pick an unmatched line to train a regex on",
+        [row["Line"] for row in unmatched_lines],
+        key="learn_line"
+    )
+
+    # Token preview
+    st.text(f"Tokenized: {tokenize_line(selected_line)}")
+
+    # Enter regex
+    regex = st.text_input("Enter a regex to capture this line", "")
+
+    # Assign fields
+    field_map = {}
+    st.write("Assign captured groups to fields:")
+    for idx, label in enumerate(
+        ["Date", "Description", "Reference", "Billed qty", "Qty.", "Unit Price",
+         "Amount excl. GST", "GST", "Amount Incl. GST"], start=1
+    ):
+        field = st.selectbox(
+            f"Group {idx} → Field",
+            ["(ignore)", "Date", "Description", "Reference", "Billed qty",
+             "Qty.", "Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST"],
+            key=f"field_{idx}"
+        )
+        if field != "(ignore)":
+            field_map[field] = idx
+
+    # Save
+    if st.button("💾 Save Pattern"):
+        token_pattern = tokenize_line(selected_line)
+        learned_patterns[token_pattern] = {
+            "regex": regex,
+            "field_map": field_map,
+            "Charge Type": st.text_input("Charge Type/Period Reference", "Custom")
+        }
+        save_learned_patterns(learned_patterns)
+        st.success("✅ Pattern saved! Will be applied on next run.")
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -298,6 +358,9 @@ if uploaded_file:
         st.subheader("Unmatched Lines (first 10)")
         for row in missed_lines[:10]:
             st.text(f"[Page {row['Page']} | Line {row['Line No.']}] {row['Line']}")
+
+        # Learning widget
+        show_learning_widget(missed_lines)
 
     if totals:
         st.subheader("Invoice Totals")
