@@ -334,6 +334,49 @@ def show_learning_widget(unmatched_lines):
         save_learned_patterns(learned_patterns)
         st.success("✅ Pattern saved! Will be applied on next run.")
 
+# -----------------------------
+# Pattern Management
+# -----------------------------
+def manage_patterns():
+    st.subheader("📚 Manage Learned Patterns")
+
+    if not learned_patterns:
+        st.info("No saved patterns yet.")
+        return
+
+    for token_pattern, pattern_data in list(learned_patterns.items()):
+        with st.expander(f"🔑 Token Pattern: {token_pattern}"):
+            st.write("**Regex:**", pattern_data.get("regex", ""))
+            st.write("**Field Map:**", pattern_data.get("field_map", {}))
+            st.write("**Charge Type:**", pattern_data.get("Charge Type", ""))
+
+            # Edit regex
+            new_regex = st.text_input(
+                f"Edit Regex ({token_pattern})",
+                value=pattern_data.get("regex", ""),
+                key=f"edit_regex_{token_pattern}"
+            )
+
+            # Edit Charge Type
+            new_charge_type = st.text_input(
+                f"Edit Charge Type ({token_pattern})",
+                value=pattern_data.get("Charge Type", "Custom"),
+                key=f"edit_charge_{token_pattern}"
+            )
+
+            # Save updates
+            if st.button(f"💾 Save Changes ({token_pattern})"):
+                learned_patterns[token_pattern]["regex"] = new_regex
+                learned_patterns[token_pattern]["Charge Type"] = new_charge_type
+                save_learned_patterns(learned_patterns)
+                st.success("✅ Pattern updated!")
+
+            # Delete pattern
+            if st.button(f"🗑️ Delete Pattern ({token_pattern})"):
+                del learned_patterns[token_pattern]
+                save_learned_patterns(learned_patterns)
+                st.warning("❌ Pattern deleted!")
+                st.experimental_rerun()
 
 # -----------------------------
 # Streamlit UI
@@ -361,6 +404,10 @@ if uploaded_file:
 
         # Learning widget
         show_learning_widget(missed_lines)
+
+    # Pattern manager always available
+    manage_patterns()
+
 
     if totals:
         st.subheader("Invoice Totals")
