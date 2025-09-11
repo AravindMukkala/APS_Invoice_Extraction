@@ -337,6 +337,9 @@ def show_learning_widget(unmatched_lines):
 # -----------------------------
 # Pattern Management
 # -----------------------------
+# -----------------------------
+# Pattern Management (User Friendly)
+# -----------------------------
 def manage_patterns():
     st.subheader("📚 Manage Learned Patterns")
 
@@ -344,39 +347,69 @@ def manage_patterns():
         st.info("No saved patterns yet.")
         return
 
+    field_options = [
+        "(ignore)", "Date", "Description", "Reference", "Charge Type/Period Reference",
+        "Billed qty", "Qty.", "Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST"
+    ]
+
     for token_pattern, pattern_data in list(learned_patterns.items()):
         with st.expander(f"🔑 Token Pattern: {token_pattern}"):
-            st.write("**Regex:**", pattern_data.get("regex", ""))
-            st.write("**Field Map:**", pattern_data.get("field_map", {}))
-            st.write("**Charge Type:**", pattern_data.get("Charge Type", ""))
 
-            # Edit regex
-            new_regex = st.text_input(
-                f"Edit Regex ({token_pattern})",
+            st.markdown("**📝 Current Regex Pattern:**")
+            new_regex = st.text_area(
+                f"Edit Regex for {token_pattern}",
                 value=pattern_data.get("regex", ""),
-                key=f"edit_regex_{token_pattern}"
+                height=80,
+                key=f"regex_{token_pattern}"
             )
 
-            # Edit Charge Type
+            # Charge Type field
             new_charge_type = st.text_input(
-                f"Edit Charge Type ({token_pattern})",
+                "Charge Type / Period Reference",
                 value=pattern_data.get("Charge Type", "Custom"),
-                key=f"edit_charge_{token_pattern}"
+                key=f"charge_{token_pattern}"
             )
 
-            # Save updates
-            if st.button(f"💾 Save Changes ({token_pattern})"):
-                learned_patterns[token_pattern]["regex"] = new_regex
-                learned_patterns[token_pattern]["Charge Type"] = new_charge_type
-                save_learned_patterns(learned_patterns)
-                st.success("✅ Pattern updated!")
+            st.markdown("**🔗 Field Mapping (captured regex groups → invoice fields):**")
 
-            # Delete pattern
-            if st.button(f"🗑️ Delete Pattern ({token_pattern})"):
-                del learned_patterns[token_pattern]
-                save_learned_patterns(learned_patterns)
-                st.warning("❌ Pattern deleted!")
-                st.experimental_rerun()
+            # Editable field map
+            field_map = pattern_data.get("field_map", {})
+            new_field_map = {}
+            max_groups = max(field_map.values()) if field_map else 5  # default 5 groups
+
+            for group_index in range(1, max_groups + 1):
+                current_field = None
+                for k, v in field_map.items():
+                    if v == group_index:
+                        current_field = k
+                        break
+
+                selection = st.selectbox(
+                    f"Group {group_index}",
+                    field_options,
+                    index=field_options.index(current_field) if current_field in field_options else 0,
+                    key=f"{token_pattern}_group_{group_index}"
+                )
+
+                if selection != "(ignore)":
+                    new_field_map[selection] = group_index
+
+            # Save / Delete buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button(f"💾 Save Changes ({token_pattern})"):
+                    learned_patterns[token_pattern]["regex"] = new_regex
+                    learned_patterns[token_pattern]["Charge Type"] = new_charge_type
+                    learned_patterns[token_pattern]["field_map"] = new_field_map
+                    save_learned_patterns(learned_patterns)
+                    st.success("✅ Pattern updated!")
+
+            with col2:
+                if st.button(f"🗑️ Delete Pattern ({token_pattern})"):
+                    del learned_patterns[token_pattern]
+                    save_learned_patterns(learned_patterns)
+                    st.warning("❌ Pattern deleted!")
+                    st.experimental_rerun()
 
 # -----------------------------
 # Streamlit UI
