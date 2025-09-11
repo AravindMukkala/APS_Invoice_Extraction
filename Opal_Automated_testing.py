@@ -297,34 +297,72 @@ def process_pdf(file_stream):
 # Learning widget
 # -----------------------------
 
-def show_learning_widget(missed_lines):
-    import streamlit as st
+def tokenize_line(line: str) -> str:
+    """Convert a line into a token pattern for matching."""
+    tokens = line.split()
+    return " ".join(["<NUM>" if t.replace(".", "").isdigit() else "<TXT>" for t in tokens])
 
+# -----------------------------
+# Learning Widget
+# -----------------------------
+def show_learning_widget(missed_lines):
     st.subheader("🧠 Teach Me (Learning Widget)")
+
     if not missed_lines:
-        st.info("✅ No unmatched lines to learn from.")
+        st.info("✅ No unmatched lines found. Nothing to train.")
         return
 
-    for ml in missed_lines[:50]:  # limit to avoid huge UI
-        st.write(f"📄 Page {ml['Page']}, Line {ml['Line No.']}: {ml['Line']}")
-        # Example UI for mapping (replace with dropdowns as you already had)
-        st.text_input("Map description:", key=f"desc_{ml['Page']}_{ml['Line No.']}")
+    st.markdown("Select which parts of the line correspond to invoice fields:")
 
-def save_pattern_callback(_):
+    # Load existing patterns if available
     try:
-        st.write("📥 Save button clicked, processing...")
+        with open("learned_patterns.json", "r") as f:
+            learned_patterns = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        learned_patterns = {}
 
-        global learned_patterns
+    # Dropdown field options with friendly labels + tooltips
+    field_options = {
+        "Ignore": "❌ Ignore this token",
+        "Date": "📅 Invoice Date (dd.mm.yyyy)",
+        "Description": "📝 Service / Item description",
+        "Reference": "🔖 Reference number or code",
+        "Qty": "🔢 Quantity value",
+        "Qty Unit": "📦 Unit of measure (e.g., EA, KG, TONNES)",
+        "Billed qty": "📊 Billed quantity from invoice",
+        "Unit Price": "💲 Price per unit",
+        "Amount excl. GST": "💰 Net amount (before tax)",
+        "GST": "🧾 Goods & Services Tax",
+        "Amount Incl. GST": "💲 Total amount (after tax)",
+        "Charge Type/Period Reference": "📅 Charge period (e.g., 01.01.2024 to 31.01.2024)",
+        "AUD": "💲 Currency AUD"
+    }
 
-        for line, dropdowns in dropdowns_per_line:
-            field_map = {}
+    new_patterns = {}
+
+    for idx, ml in enumerate(missed_lines[:10]):  # Limit to first 10 for sanity
+        st.markdown(f"**📄 Page {ml['Page']}, Line {ml['Line No.']}**")
+        line = ml["Line"]
+        tokens = line.split()
+
+        dropdowns = []
+        cols = st.columns(len(tokens))
+        for i, token in enumerate(tokens):
+            with cols[i]:
+                choice = st.selectbox(
+                    f"{token}",
+                    list(field_options.keys()),
+                    format_func=lambda x: field_options[x],
+                    key=f"dd_{idx}_{i}"
+                )
+                dropdowns.append(choice)
+
+        # Save button per line
+        if st.button(f"💾 Save Mapping for Line {idx+1}", key=f"save_{idx}"):
             regex_parts = []
-            tokens = line.split()
-
-            for i, dd in enumerate(dropdowns):
+            field_map = {}
+            for i, label in enumerate(dropdowns):
                 token = tokens[i]
-                label = dd.value
-
                 if label == "Ignore":
                     regex_parts.append(re.escape(token))
                 elif label == "Date":
@@ -360,44 +398,34 @@ def save_pattern_callback(_):
                 elif label == "AUD":
                     regex_parts.append(r"AUD")
 
-            token_pattern = tokenize_line(line)
             final_regex = r"\s+".join(regex_parts)
+            token_pattern = tokenize_line(line)
 
-            # ✅ Pre-validate regex before saving
+            # ✅ Validate before saving
             try:
                 compiled = re.compile(final_regex)
                 m = compiled.match(line)
                 if not m:
-                    st.warning(f"⚠️ Pattern didn’t match this example line: {line}")
-                    continue
-                groups = m.groups()
-
-                # ✅ Check group indexes
-                for field, gi in field_map.items():
-                    if gi <= 0 or gi > len(groups):
-                        st.warning(f"⚠️ Invalid mapping for field `{field}` → group {gi} out of {len(groups)}")
-                        break
+                    st.warning("⚠️ Pattern didn’t match this example line. Not saved.")
                 else:
-                    # Save only if validation passes
-                    learned_patterns[token_pattern] = {
-                        "regex": final_regex,
-                        "field_map": field_map,
-                        "Charge Type": "Auto-Learned"
-                    }
-                    st.success("✅ Pattern saved successfully.")
+                    groups = m.groups()
+                    valid = True
+                    for field, gi in field_map.items():
+                        if gi <= 0 or gi > len(groups):
+                            st.warning(f"⚠️ Invalid mapping for `{field}` → group {gi}")
+                            valid = False
+                    if valid:
+                        learned_patterns[token_pattern] = {
+                            "regex": final_regex,
+                            "field_map": field_map,
+                            "Charge Type": "Auto-Learned"
+                        }
+                        with open("learned_patterns.json", "w") as f:
+                            json.dump(learned_patterns, f, indent=2)
+                        st.success("✅ Pattern saved successfully!")
 
             except re.error as e:
-                st.error(f"❌ Regex error: {e}")
-                continue
-
-        # Save to file if at least one valid pattern
-        if learned_patterns:
-            with open("learned_patterns.json", "w") as f:
-                json.dump(learned_patterns, f, indent=2)
-
-    except Exception as e:
-        st.error(f"⚠️ Error while saving pattern: {e}")
-# -----------------------------
+                st.error(f"❌ Regex error: {e}")# -----------------------------
 # Pattern Management
 # -----------------------------
 # -----------------------------
