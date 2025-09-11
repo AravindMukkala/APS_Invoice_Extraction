@@ -222,6 +222,7 @@ def process_pdf(file_stream):
                         field_map = pattern_data["field_map"]
                         charge_type = pattern_data.get("Charge Type", "")
                         current_token_pattern = tokenize_line(line)
+
                         if current_token_pattern == token_pattern:
                             match = re.match(regex, line)
                             if match:
@@ -231,8 +232,14 @@ def process_pdf(file_stream):
                                     "Customer": customer,
                                     "Charge Type/Period Reference": charge_type,
                                 }
+
+                                # ✅ Safe group lookup
                                 for field, group_index in field_map.items():
-                                    parsed[field] = groups[group_index - 1]
+                                    if 0 < group_index <= len(groups):
+                                        parsed[field] = groups[group_index - 1]
+                                    else:
+                                        parsed[field] = ""  # fallback empty if invalid mapping
+
                                 data.append(parsed)
                                 matched = True
                                 break
@@ -259,8 +266,8 @@ def process_pdf(file_stream):
                 # ---------------- Unmatched ----------------
                 if not matched and re.search(r"\d{2}\.\d{2}\.\d{4}.*AUD", line):
                     missed_lines.append({
-                        "Page": page_num, "Line No.": i + 1, "Customer": customer, "Line": line,
-                        "Note": "Potential invoice data (unparsed)"
+                        "Page": page_num, "Line No.": i + 1, "Customer": customer,
+                        "Line": line, "Note": "Potential invoice data (unparsed)"
                     })
 
     # ---------------- Totals ----------------
@@ -285,55 +292,97 @@ def process_pdf(file_stream):
     return invoice_no, data, missed_lines, totals
 
 
+
 # -----------------------------
 # Learning widget
 # -----------------------------
-def show_learning_widget(unmatched_lines):
-    st.subheader("🧠 Learn New Pattern")
-    if not unmatched_lines:
-        st.info("No unmatched lines available for training.")
-        return
+def save_pattern_callback(_):
+    try:
+        st.write("📥 Save button clicked, processing...")
 
-    # Select a line
-    selected_line = st.selectbox(
-        "Pick an unmatched line to train a regex on",
-        [row["Line"] for row in unmatched_lines],
-        key="learn_line"
-    )
+        global learned_patterns
 
-    # Token preview
-    st.text(f"Tokenized: {tokenize_line(selected_line)}")
+        for line, dropdowns in dropdowns_per_line:
+            field_map = {}
+            regex_parts = []
+            tokens = line.split()
 
-    # Enter regex
-    regex = st.text_input("Enter a regex to capture this line", "")
+            for i, dd in enumerate(dropdowns):
+                token = tokens[i]
+                label = dd.value
 
-    # Assign fields
-    field_map = {}
-    st.write("Assign captured groups to fields:")
-    for idx, label in enumerate(
-        ["Date", "Description", "Reference", "Billed qty", "Qty.", "Unit Price",
-         "Amount excl. GST", "GST", "Amount Incl. GST"], start=1
-    ):
-        field = st.selectbox(
-            f"Group {idx} → Field",
-            ["(ignore)", "Date", "Description", "Reference", "Billed qty",
-             "Qty.", "Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST"],
-            key=f"field_{idx}"
-        )
-        if field != "(ignore)":
-            field_map[field] = idx
+                if label == "Ignore":
+                    regex_parts.append(re.escape(token))
+                elif label == "Date":
+                    regex_parts.append(r"(\d{2}\.\d{2}\.\d{4})")
+                    field_map["Date"] = len(regex_parts)
+                elif label == "Qty":
+                    regex_parts.append(r"([\d\.]+)")
+                    field_map["Qty."] = len(regex_parts)
+                elif label == "Qty Unit":
+                    regex_parts.append(r"(\w+)")
+                    field_map["Billed qty"] = len(regex_parts)
+                elif label == "Unit Price":
+                    regex_parts.append(r"([\d\.]+)")
+                    field_map["Unit Price"] = len(regex_parts)
+                elif label == "Amount excl. GST":
+                    regex_parts.append(r"([\d,\.]+)")
+                    field_map["Amount excl. GST"] = len(regex_parts)
+                elif label == "GST":
+                    regex_parts.append(r"([\d,\.]+)")
+                    field_map["GST"] = len(regex_parts)
+                elif label == "Amount Incl. GST":
+                    regex_parts.append(r"([\d,\.]+)")
+                    field_map["Amount Incl. GST"] = len(regex_parts)
+                elif label == "Reference":
+                    regex_parts.append(r"([\w\-\/\.]+)")
+                    field_map["Reference"] = len(regex_parts)
+                elif label == "Description":
+                    regex_parts.append(r"(.+?)")
+                    field_map["Description"] = len(regex_parts)
+                elif label == "Charge Type/Period Reference":
+                    regex_parts.append(r"(.+?)")
+                    field_map["Charge Type/Period Reference"] = len(regex_parts)
+                elif label == "AUD":
+                    regex_parts.append(r"AUD")
 
-    # Save
-    if st.button("💾 Save Pattern"):
-        token_pattern = tokenize_line(selected_line)
-        learned_patterns[token_pattern] = {
-            "regex": regex,
-            "field_map": field_map,
-            "Charge Type": st.text_input("Charge Type/Period Reference", "Custom")
-        }
-        save_learned_patterns(learned_patterns)
-        st.success("✅ Pattern saved! Will be applied on next run.")
+            token_pattern = tokenize_line(line)
+            final_regex = r"\s+".join(regex_parts)
 
+            # ✅ Pre-validate regex before saving
+            try:
+                compiled = re.compile(final_regex)
+                m = compiled.match(line)
+                if not m:
+                    st.warning(f"⚠️ Pattern didn’t match this example line: {line}")
+                    continue
+                groups = m.groups()
+
+                # ✅ Check group indexes
+                for field, gi in field_map.items():
+                    if gi <= 0 or gi > len(groups):
+                        st.warning(f"⚠️ Invalid mapping for field `{field}` → group {gi} out of {len(groups)}")
+                        break
+                else:
+                    # Save only if validation passes
+                    learned_patterns[token_pattern] = {
+                        "regex": final_regex,
+                        "field_map": field_map,
+                        "Charge Type": "Auto-Learned"
+                    }
+                    st.success("✅ Pattern saved successfully.")
+
+            except re.error as e:
+                st.error(f"❌ Regex error: {e}")
+                continue
+
+        # Save to file if at least one valid pattern
+        if learned_patterns:
+            with open("learned_patterns.json", "w") as f:
+                json.dump(learned_patterns, f, indent=2)
+
+    except Exception as e:
+        st.error(f"⚠️ Error while saving pattern: {e}")
 # -----------------------------
 # Pattern Management
 # -----------------------------
