@@ -309,25 +309,18 @@ import re
 
 def guess_field(token: str) -> str:
     """Heuristic rules to auto-suggest field labels based on token shape."""
-    # Date dd.mm.yyyy
-    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", token):
+    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", token):  # dd.mm.yyyy
         return "Date"
-    # Currency AUD
     if token.upper() == "AUD":
         return "AUD"
-    # Pure number (int/decimal)
     if re.fullmatch(r"\d+(\.\d+)?", token):
-        return "Qty"   # could also be Unit Price or Amount — context decides
-    # Money with commas/decimals
+        return "Qty"
     if re.fullmatch(r"\d{1,3}(?:,\d{3})*(\.\d{2})?", token):
         return "Amount excl. GST"
-    # GST 10.00 etc.
     if re.fullmatch(r"\d+(\.\d{2})?", token):
         return "GST"
-    # Reference codes (letters/numbers/dashes)
     if re.fullmatch(r"[A-Za-z0-9\-\/\.]+", token) and any(c.isalpha() for c in token):
         return "Reference"
-    # Default to description (catch-all text)
     return "Description"
 
 
@@ -362,30 +355,34 @@ def show_learning_widget(missed_lines):
         "AUD": "💲 Currency AUD"
     }
 
-    for idx, ml in enumerate(missed_lines[:10]):  # cap at 10 lines
+    for idx, ml in enumerate(missed_lines[:10]):
         st.markdown(f"**📄 Page {ml['Page']}, Line {ml['Line No.']}**")
         line = ml["Line"]
         tokens = line.split()
         token_pattern = tokenize_line(line)
 
-        # Prefill: If pattern already learned, reuse mapping
+        # --- Prefill choices + confidence ---
+        suggested_fields, confidence = [], []
+
         if token_pattern in learned_patterns:
             pattern_data = learned_patterns[token_pattern]
             field_map = pattern_data.get("field_map", {})
             group_to_field = {v: k for k, v in field_map.items()}
-            suggested_fields = [
-                group_to_field.get(i + 1, "Ignore") for i in range(len(tokens))
-            ]
+            for i in range(len(tokens)):
+                field = group_to_field.get(i + 1, "Ignore")
+                suggested_fields.append(field)
+                confidence.append("✅ Confirmed")
         else:
-            # Fresh heuristic guess
-            suggested_fields = [guess_field(tok) for tok in tokens]
+            for tok in tokens:
+                suggested_fields.append(guess_field(tok))
+                confidence.append("🔵 Guessed")
 
         dropdowns = []
         cols = st.columns(len(tokens))
         for i, token in enumerate(tokens):
             with cols[i]:
                 choice = st.selectbox(
-                    f"{token}",
+                    f"{token} {confidence[i]}",
                     list(field_options.keys()),
                     index=list(field_options.keys()).index(suggested_fields[i])
                         if suggested_fields[i] in field_options else 0,
@@ -394,7 +391,7 @@ def show_learning_widget(missed_lines):
                 )
                 dropdowns.append(choice)
 
-        # --- Save mapping (using the fixed capturing group logic) ---
+        # --- Save button (unchanged from fixed version) ---
         if st.button(f"💾 Save Mapping for Line {idx+1}", key=f"save_{idx}"):
             regex_parts = []
             field_map = {}
