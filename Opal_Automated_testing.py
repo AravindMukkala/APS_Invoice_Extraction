@@ -296,6 +296,20 @@ def process_pdf(file_stream):
 # -----------------------------
 # Learning widget
 # -----------------------------
+
+def show_learning_widget(missed_lines):
+    import streamlit as st
+
+    st.subheader("🧠 Teach Me (Learning Widget)")
+    if not missed_lines:
+        st.info("✅ No unmatched lines to learn from.")
+        return
+
+    for ml in missed_lines[:50]:  # limit to avoid huge UI
+        st.write(f"📄 Page {ml['Page']}, Line {ml['Line No.']}: {ml['Line']}")
+        # Example UI for mapping (replace with dropdowns as you already had)
+        st.text_input("Map description:", key=f"desc_{ml['Page']}_{ml['Line No.']}")
+
 def save_pattern_callback(_):
     try:
         st.write("📥 Save button clicked, processing...")
