@@ -338,7 +338,7 @@ def show_learning_widget(unmatched_lines):
 # Pattern Management
 # -----------------------------
 # -----------------------------
-# Pattern Management (User Friendly)
+# Pattern Management (User Friendly + Test Tool)
 # -----------------------------
 def manage_patterns():
     st.subheader("📚 Manage Learned Patterns")
@@ -355,6 +355,7 @@ def manage_patterns():
     for token_pattern, pattern_data in list(learned_patterns.items()):
         with st.expander(f"🔑 Token Pattern: {token_pattern}"):
 
+            # Regex editor
             st.markdown("**📝 Current Regex Pattern:**")
             new_regex = st.text_area(
                 f"Edit Regex for {token_pattern}",
@@ -363,19 +364,18 @@ def manage_patterns():
                 key=f"regex_{token_pattern}"
             )
 
-            # Charge Type field
+            # Charge type
             new_charge_type = st.text_input(
                 "Charge Type / Period Reference",
                 value=pattern_data.get("Charge Type", "Custom"),
                 key=f"charge_{token_pattern}"
             )
 
+            # Field mapping
             st.markdown("**🔗 Field Mapping (captured regex groups → invoice fields):**")
-
-            # Editable field map
             field_map = pattern_data.get("field_map", {})
             new_field_map = {}
-            max_groups = max(field_map.values()) if field_map else 5  # default 5 groups
+            max_groups = max(field_map.values()) if field_map else 5  # assume 5 groups if none saved
 
             for group_index in range(1, max_groups + 1):
                 current_field = None
@@ -394,6 +394,31 @@ def manage_patterns():
                 if selection != "(ignore)":
                     new_field_map[selection] = group_index
 
+            # 🔍 Test Pattern
+            st.markdown("**🧪 Test Your Pattern**")
+            test_line = st.text_input(
+                "Paste a sample invoice line to test this regex",
+                "",
+                key=f"testline_{token_pattern}"
+            )
+            if st.button(f"▶️ Run Test ({token_pattern})"):
+                try:
+                    match = re.match(new_regex, test_line)
+                    if match:
+                        results = {}
+                        for field, group_idx in new_field_map.items():
+                            if group_idx <= len(match.groups()):
+                                results[field] = match.group(group_idx)
+                        if results:
+                            st.success("✅ Match Found!")
+                            st.json(results)
+                        else:
+                            st.warning("⚠️ Regex matched, but no fields were mapped.")
+                    else:
+                        st.error("❌ No match. Check your regex or sample line.")
+                except re.error as e:
+                    st.error(f"⚠️ Invalid regex: {e}")
+
             # Save / Delete buttons
             col1, col2 = st.columns(2)
             with col1:
@@ -410,7 +435,6 @@ def manage_patterns():
                     save_learned_patterns(learned_patterns)
                     st.warning("❌ Pattern deleted!")
                     st.experimental_rerun()
-
 # -----------------------------
 # Streamlit UI
 # -----------------------------
