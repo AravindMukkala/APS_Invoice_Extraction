@@ -658,7 +658,7 @@ def manage_patterns():
 # Streamlit UI
 # -----------------------------
 st.set_page_config(page_title="Invoice PDF → Excel", layout="wide")
-st.title("📄 Invoice PDF → Excel Extractor")
+st.title("📄 OPAL Invoice PDF → Excel Extractor")
 tab1, tab2, tab3 = st.tabs(["📂 Upload & Extract", "🧠 Teach Me", "📚 Manage Patterns"])
 
 
