@@ -306,20 +306,11 @@ def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Option to exclude manual/adjustment lines
-    exclude_keywords = ["Manual", "Adjustment", "Credit"]
-    df["Excluded"] = df["Description"].str.contains("|".join(exclude_keywords), case=False, na=False)
-
-    if st.checkbox("🔧 Exclude adjustments (Manual/Credit/Adjustment lines) from totals"):
-        df_calc = df[~df["Excluded"]]
-    else:
-        df_calc = df
-
-    # Calculate line totals
+    # ✅ Always include ALL lines in totals
     line_totals = {
-        "Amount excl. GST": float(df_calc["Amount excl. GST"].sum() if "Amount excl. GST" in df_calc else 0),
-        "GST": float(df_calc["GST"].sum() if "GST" in df_calc else 0),
-        "Amount Incl. GST": float(df_calc["Amount Incl. GST"].sum() if "Amount Incl. GST" in df_calc else 0),
+        "Amount excl. GST": float(df["Amount excl. GST"].sum() if "Amount excl. GST" in df else 0),
+        "GST": float(df["GST"].sum() if "GST" in df else 0),
+        "Amount Incl. GST": float(df["Amount Incl. GST"].sum() if "Amount Incl. GST" in df else 0),
     }
 
     # Compare with invoice totals
@@ -335,25 +326,23 @@ def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
 
         comparison.append({
             "Field": field,
-            "From Invoice": f"{expected:,.2f}",
-            "From Lines (sum)": f"{actual:,.2f}",
+            "From Invoice Footer": f"{expected:,.2f}",
+            "From ALL Lines (sum)": f"{actual:,.2f}",
             "Difference": f"{diff:,.2f}",
-            "Status": "✅ OK" if within_tol else "❌ Mismatch"
+            "Status": "✅ Match" if within_tol else "❌ Mismatch"
         })
 
     # Show results
-    if all(row["Status"] == "✅ OK" for row in comparison):
-        st.success("✅ Line items add up correctly to invoice totals!")
-    else:
-        st.error("⚠️ Differences found between line items and invoice totals.")
-
+    st.markdown("### 📋 Totals Comparison")
     st.dataframe(pd.DataFrame(comparison))
 
-    # Breakdown with exclusion marker
+    # ✅ Explicitly show what you consider the TRUE invoice total
+    st.success(f"✅ Total from ALL lines (your calculated invoice total): {line_totals['Amount Incl. GST']:,.2f}")
+
+    # Show line item breakdown
     st.markdown("### 🔍 Line Item Breakdown")
-    cols_to_show = [c for c in ["Description", "Amount excl. GST", "GST", "Amount Incl. GST", "Excluded"] if c in df.columns]
+    cols_to_show = [c for c in ["Description", "Amount excl. GST", "GST", "Amount Incl. GST"] if c in df.columns]
     st.dataframe(df[cols_to_show])
-    st.info(f"➡️ Sum of 'Amount Incl. GST' (after exclusions): {df_calc['Amount Incl. GST'].sum():,.2f}")
 # -----------------------------
 # Learning widget
 # -----------------------------
