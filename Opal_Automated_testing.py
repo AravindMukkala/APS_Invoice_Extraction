@@ -675,6 +675,10 @@ if uploaded_file:
         st.subheader("Extracted Data (preview)")
         st.dataframe(pd.DataFrame(data).head(20))
 
+    # 🔹 Show invoice totals summary instead of raw JSON
+    if data and totals:
+        show_invoice_totals(data, totals, tolerance=0.05)
+
     if missed_lines:
         st.subheader("Unmatched Lines (first 10)")
         for row in missed_lines[:10]:
@@ -685,25 +689,3 @@ if uploaded_file:
 
     # Pattern manager always available
     manage_patterns()
-
-        # Example usage
-    show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05)
-
-    if totals:
-        st.subheader("Invoice Totals")
-        st.json(totals)
-
-    # --- Save to Excel ---
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if data:
-            pd.DataFrame(data).to_excel(writer, sheet_name="Invoice Data", index=False)
-        if missed_lines:
-            pd.DataFrame(missed_lines).to_excel(writer, sheet_name="Unmatched Lines", index=False)
-
-    st.download_button(
-        label="📥 Download Excel",
-        data=output.getvalue(),
-        file_name=f"Opal_Invoice_{invoice_no or 'Unknown'}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
