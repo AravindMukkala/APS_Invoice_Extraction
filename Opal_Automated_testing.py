@@ -293,60 +293,7 @@ def process_pdf(file_stream):
 
 
 #invoice totals
-def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
-    st.subheader("📊 Invoice Totals Check")
-
-    df = pd.DataFrame(extracted_lines)
-    if df.empty:
-        st.warning("⚠️ No line items found to calculate totals.")
-        return
-
-    # Convert extracted columns to numeric
-    for col in ["Amount excl. GST", "GST", "Amount Incl. GST"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-
-    # Calculate line totals
-    line_totals = {
-        "Amount excl. GST": float(df["Amount excl. GST"].sum() if "Amount excl. GST" in df else 0),
-        "GST": float(df["GST"].sum() if "GST" in df else 0),
-        "Amount Incl. GST": float(df["Amount Incl. GST"].sum() if "Amount Incl. GST" in df else 0),
-    }
-
-    # Compare with invoice totals
-    comparison = []
-    for field, expected in invoice_totals.items():
-        try:
-            expected = float(expected)
-        except (ValueError, TypeError):
-            expected = 0.0
-        actual = float(line_totals.get(field, 0.0))
-        diff = actual - expected
-        within_tol = abs(diff) <= tolerance
-
-        comparison.append({
-            "Field": field,
-            "From Invoice": f"{expected:,.2f}",
-            "From Lines (sum)": f"{actual:,.2f}",
-            "Difference": f"{diff:,.2f}",
-            "Status": "✅ OK" if within_tol else "❌ Mismatch"
-        })
-
-    # Show results
-    if all(row["Status"] == "✅ OK" for row in comparison):
-        st.success("✅ Line items add up correctly to invoice totals!")
-    else:
-        st.error("⚠️ Differences found between line items and invoice totals.")
-
-    st.dataframe(pd.DataFrame(comparison))
-
-    # 🔍 Show the raw line contributions for debugging
-    st.markdown("### 🔍 Line Item Breakdown")
-    cols_to_show = [c for c in ["Description", "Amount excl. GST", "GST", "Amount Incl. GST"] if c in df.columns]
-    st.dataframe(df[cols_to_show])
-    st.info(f"➡️ Sum of 'Amount Incl. GST': {df['Amount Incl. GST'].sum():,.2f}")
-
-
+970071408	R-WAS3001 Wasteflex	19.08.2025	Manual Price - UNDERWEIGHT BINS JUL 25 Underweight Bins 7.000 TO 200.00 1,400.00 140.00 1,540.00 AUD	Manual Price		7.000 TO	7.000 TO	200.00	1,400.00	140.00	1,540.00
 # -----------------------------
 # Learning widget
 # -----------------------------
