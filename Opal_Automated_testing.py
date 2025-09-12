@@ -292,6 +292,72 @@ def process_pdf(file_stream):
     return invoice_no, data, missed_lines, totals
 
 
+#invoice totals
+
+def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
+    """
+    Compare extracted line item totals with invoice totals.
+
+    Parameters:
+        extracted_lines (list[dict]): Each line dict should include
+            'Amount excl. GST', 'GST', 'Amount Incl. GST'
+        invoice_totals (dict): Expected totals from the invoice footer
+        tolerance (float): Allowed difference before marking as mismatch
+    """
+    st.subheader("📊 Invoice Totals Check")
+
+    # --- Step 1: Calculate sums from extracted lines ---
+    df_lines = pd.DataFrame(extracted_lines)
+    line_sums = {
+        "Amount excl. GST": df_lines.get("Amount excl. GST", pd.Series(dtype=float)).sum(),
+        "GST": df_lines.get("GST", pd.Series(dtype=float)).sum(),
+        "Amount Incl. GST": df_lines.get("Amount Incl. GST", pd.Series(dtype=float)).sum()
+    }
+
+    # --- Step 2: Build comparison table ---
+    rows = []
+    fields = ["Amount excl. GST", "GST", "Amount Incl. GST"]
+    all_match = True
+
+    for field in fields:
+        extracted = line_sums.get(field, 0.0)
+        expected = invoice_totals.get(field, 0.0)
+        diff = extracted - expected
+        status = "✅ Match" if abs(diff) <= tolerance else "❌ Mismatch"
+        if status == "❌ Mismatch":
+            all_match = False
+        rows.append({
+            "Field": field,
+            "Sum of Lines": f"{extracted:,.2f}",
+            "Invoice Total": f"{expected:,.2f}",
+            "Difference": f"{diff:,.2f}",
+            "Status": status
+        })
+
+    df = pd.DataFrame(rows)
+
+    # --- Step 3: Visual summary card ---
+    if all_match:
+        st.markdown(
+            f"""
+            <div style="padding:1em; background:#e6ffed; border:2px solid #2ecc71; border-radius:10px; text-align:center; font-size:1.2em;">
+                ✅ All extracted totals match invoice (within ±{tolerance:.2f}).
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"""
+            <div style="padding:1em; background:#ffecec; border:2px solid #e74c3c; border-radius:10px; text-align:center; font-size:1.2em;">
+                ⚠️ Differences found! Some values differ by more than ±{tolerance:.2f}.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # --- Step 4: Detailed comparison table ---
+    st.dataframe(df, use_container_width=True)
 
 # -----------------------------
 # Learning widget
