@@ -294,80 +294,41 @@ def process_pdf(file_stream):
 
 #invoice totals
 def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
-    st.subheader("📊 Invoice Totals Check")
+    st.subheader("📊 Invoice Totals Check (Amount Incl. GST Only)")
 
     df = pd.DataFrame(extracted_lines)
     if df.empty:
         st.warning("⚠️ No line items found to calculate totals.")
         return
 
-    # ---------------- Numeric Conversion ----------------
-    for col in ["Amount excl. GST", "GST", "Amount Incl. GST"]:
-        if col in df.columns:
-            df[col] = (
-                df[col].astype(str)                   # ensure string
-                       .str.replace(",", "")         # remove commas
-                       .str.extract(r"([\d\.]+)")[0]  # extract numeric part
-                       .astype(float)               # convert to float
-                       .fillna(0)
-            )
+    # Ensure Amount Incl. GST is numeric
+    if "Amount Incl. GST" in df.columns:
+        df["Amount Incl. GST"] = (
+            df["Amount Incl. GST"].astype(str)
+              .str.replace(",", "")
+              .str.extract(r"([\d\.]+)")[0]
+              .astype(float)
+              .fillna(0)
+        )
 
-    # ---------------- Identify Manual Price lines ----------------
+    # Mark Manual Price lines
     df['Is Manual Price'] = df['Charge Type/Period Reference'].str.contains("Manual Price", na=False)
 
-    # ---------------- Fill missing Amount excl. GST / GST for Manual Price ----------------
-    # If Amount excl. GST missing, compute from Amount Incl. GST - GST
-    df.loc[df['Is Manual Price'] & (df['Amount excl. GST'].isna() | (df['Amount excl. GST']==0)), 'Amount excl. GST'] = \
-        df.loc[df['Is Manual Price'], 'Amount Incl. GST'] - df.loc[df['Is Manual Price'], 'GST'].fillna(0)
+    # ---------------- Sum Amount Incl. GST ----------------
+    actual_total = df["Amount Incl. GST"].sum()
 
-    # If GST missing, compute from Amount Incl. GST - Amount excl. GST
-    df.loc[df['Is Manual Price'] & (df['GST'].isna() | (df['GST']==0)), 'GST'] = \
-        df.loc[df['Is Manual Price'], 'Amount Incl. GST'] - df.loc[df['Is Manual Price'], 'Amount excl. GST']
+    # ---------------- Compare with invoice total ----------------
+    expected_total = float(str(invoice_totals.get("Amount Incl. GST", 0)).replace(",", ""))
+    diff = actual_total - expected_total
+    within_tol = abs(diff) <= tolerance
 
-    # Ensure all numeric fields are floats
-    for col in ["Amount excl. GST", "GST", "Amount Incl. GST"]:
-        df[col] = df[col].astype(float).fillna(0)
+    # ---------------- Display ----------------
+    status = "✅ OK" if within_tol else "❌ Mismatch"
+    st.write(f"**Invoice Amount Incl. GST:** {expected_total:,.2f}")
+    st.write(f"**Sum of All Lines (Incl. Manual Price):** {actual_total:,.2f}")
+    st.write(f"**Difference:** {diff:,.2f} → {status}")
 
-    # ---------------- Sum All Lines ----------------
-    line_totals = {
-        "Amount excl. GST": df["Amount excl. GST"].sum(),
-        "GST": df["GST"].sum(),
-        "Amount Incl. GST": df["Amount Incl. GST"].sum()
-    }
-
-    # ---------------- Compare with Invoice Totals ----------------
-    comparison = []
-    for field, expected in invoice_totals.items():
-        try:
-            expected = float(str(expected).replace(",", ""))
-        except (ValueError, TypeError):
-            expected = 0.0
-        actual = float(line_totals.get(field, 0.0))
-        diff = actual - expected
-        within_tol = abs(diff) <= tolerance
-
-        comparison.append({
-            "Field": field,
-            "From Invoice": f"{expected:,.2f}",
-            "From Lines (sum)": f"{actual:,.2f}",
-            "Difference": f"{diff:,.2f}",
-            "Status": "✅ OK" if within_tol else "❌ Mismatch"
-        })
-
-    # ---------------- Display Results ----------------
-    if all(row["Status"] == "✅ OK" for row in comparison):
-        st.success("✅ All line items (including Manual Price and adjustments) add up to invoice totals!")
-    else:
-        st.error("⚠️ Differences found between line items and invoice totals.")
-
-    st.dataframe(pd.DataFrame(comparison))
-
-    # ---------------- Show Full Breakdown ----------------
-    st.markdown("### 🔍 Line Item Breakdown (all lines included)")
-    cols_to_show = [c for c in ["Description", "Charge Type/Period Reference", "Amount excl. GST", "GST", "Amount Incl. GST", "Is Manual Price"] if c in df.columns]
-    st.dataframe(df[cols_to_show])
-
-    st.info(f"➡️ Sum of 'Amount Incl. GST': {df['Amount Incl. GST'].sum():,.2f}")
+    # Optional: breakdown of Manual Price lines
     manual_total = df.loc[df['Is Manual Price'], 'Amount Incl. GST'].sum()
     st.info(f"➡️ Sum of Manual Price lines: {manual_total:,.2f}")
 # -----------------------------
