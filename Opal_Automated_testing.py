@@ -670,3 +670,25 @@ if uploaded_file:
 
     # Pattern manager always available
     manage_patterns()
+
+    # --- Save to Excel ---
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        if data:
+            pd.DataFrame(data).to_excel(writer, sheet_name="Invoice Data", index=False)
+
+        if missed_lines:
+            pd.DataFrame(missed_lines).to_excel(writer, sheet_name="Unmatched Lines", index=False)
+
+        if totals:
+            # Save invoice totals as a single-row sheet
+            pd.DataFrame([totals]).to_excel(writer, sheet_name="Invoice Totals", index=False)
+
+    # ✅ Streamlit download button
+    st.download_button(
+        label="📥 Download Excel",
+        data=output.getvalue(),
+        file_name=f"Opal_Invoice_{invoice_no or 'Unknown'}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
