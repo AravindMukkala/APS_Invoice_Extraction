@@ -302,19 +302,31 @@ def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
         return
 
     # ---------------- Numeric Conversion ----------------
-    # Ensure amounts are properly numeric (handles commas and any leftover text)
     for col in ["Amount excl. GST", "GST", "Amount Incl. GST"]:
         if col in df.columns:
             df[col] = (
-                df[col].astype(str)                  # Ensure string
-                       .str.replace(",", "")        # Remove commas
-                       .str.extract(r"([\d\.]+)")[0]  # Extract numeric part
-                       .astype(float)              # Convert to float
+                df[col].astype(str)                   # ensure string
+                       .str.replace(",", "")         # remove commas
+                       .str.extract(r"([\d\.]+)")[0]  # extract numeric part
+                       .astype(float)               # convert to float
                        .fillna(0)
             )
 
-    # Mark Manual Price lines for clarity
+    # ---------------- Identify Manual Price lines ----------------
     df['Is Manual Price'] = df['Charge Type/Period Reference'].str.contains("Manual Price", na=False)
+
+    # ---------------- Fill missing Amount excl. GST / GST for Manual Price ----------------
+    # If Amount excl. GST missing, compute from Amount Incl. GST - GST
+    df.loc[df['Is Manual Price'] & (df['Amount excl. GST'].isna() | (df['Amount excl. GST']==0)), 'Amount excl. GST'] = \
+        df.loc[df['Is Manual Price'], 'Amount Incl. GST'] - df.loc[df['Is Manual Price'], 'GST'].fillna(0)
+
+    # If GST missing, compute from Amount Incl. GST - Amount excl. GST
+    df.loc[df['Is Manual Price'] & (df['GST'].isna() | (df['GST']==0)), 'GST'] = \
+        df.loc[df['Is Manual Price'], 'Amount Incl. GST'] - df.loc[df['Is Manual Price'], 'Amount excl. GST']
+
+    # Ensure all numeric fields are floats
+    for col in ["Amount excl. GST", "GST", "Amount Incl. GST"]:
+        df[col] = df[col].astype(float).fillna(0)
 
     # ---------------- Sum All Lines ----------------
     line_totals = {
