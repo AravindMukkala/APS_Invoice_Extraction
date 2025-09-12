@@ -324,50 +324,32 @@ def guess_field(token: str) -> str:
     return "Description"
 
 
-def show_learning_widget(missed_lines):
-    st.subheader("🧠 Teach Me (Learning Widget)")
+def show_learning_widget(idx, unmatched_line, tokens, confidences, suggested_fields, learned_patterns):
+    st.markdown("### 🧠 Train Extractor")
 
-    if not missed_lines:
-        st.info("✅ No unmatched lines found. Nothing to train.")
-        return
+    # Friendly field options
+    field_options = {
+        "Ignore": "❌ Ignore this token",
+        "Date": "📅 Date",
+        "Description": "📝 Description",
+        "Reference": "🔖 Reference",
+        "Charge Type/Period Reference": "📅 Charge / Period",
+        "Billed qty": "📊 Billed Quantity",
+        "Qty.": "🔢 Quantity",
+        "Qty Unit": "📦 Unit (EA, KG, TONNES)",
+        "Unit Price": "💲 Unit Price",
+        "Amount excl. GST": "💰 Net Amount",
+        "GST": "🧾 GST",
+        "Amount Incl. GST": "💲 Total Amount",
+        "AUD": "💲 AUD (currency)"
+    }
 
-    st.markdown("Select which parts of the line correspond to invoice fields:")
+    dropdowns = []
 
-    try:
-        with open("learned_patterns.json", "r") as f:
-            learned_patterns = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        learned_patterns = {}
-
-    field_options = list(field_options.keys())   # reuse from widget
-
-
-    for idx, ml in enumerate(missed_lines[:10]):
-        st.markdown(f"**📄 Page {ml['Page']}, Line {ml['Line No.']}**")
-        line = ml["Line"]
-        tokens = line.split()
-        token_pattern = tokenize_line(line)
-
-        # --- Prefill choices + confidence ---
-        suggested_fields, confidence = [], []
-
-        if token_pattern in learned_patterns:
-            pattern_data = learned_patterns[token_pattern]
-            field_map = pattern_data.get("field_map", {})
-            group_to_field = {v: k for k, v in field_map.items()}
-            for i in range(len(tokens)):
-                field = group_to_field.get(i + 1, "Ignore")
-                suggested_fields.append(field)
-                confidence.append("✅ Confirmed")
-        else:
-            for tok in tokens:
-                suggested_fields.append(guess_field(tok))
-                confidence.append("🔵 Guessed")
-
-        dropdowns = []
-        for i, token in enumerate(tokens):
+    # Vertical layout for better readability
+    for i, token in enumerate(tokens):
         choice = st.selectbox(
-            f"Token: `{token}` {confidence[i]}",
+            f"Token: `{token}` | Confidence: {confidences[i]}",
             list(field_options.keys()),
             index=list(field_options.keys()).index(suggested_fields[i])
                 if suggested_fields[i] in field_options else 0,
@@ -376,201 +358,93 @@ def show_learning_widget(missed_lines):
         )
         dropdowns.append(choice)
 
+    # Save button
+    if st.button("✅ Save Pattern", key=f"save_{idx}"):
+        field_map = {}
+        regex_parts = []
+        valid = True
 
-        # --- Save button (unchanged from fixed version) ---
-        if st.button(f"💾 Save Mapping for Line {idx+1}", key=f"save_{idx}"):
-            regex_parts = []
-            field_map = {}
-            group_index = 0
+        for token, field in zip(tokens, dropdowns):
+            if field != "Ignore":
+                field_map[field] = token
 
-            for i, label in enumerate(dropdowns):
-                token = tokens[i]
+            # Build regex pattern
+            if field == "Date":
+                regex_parts.append(r"(\d{2}\.\d{2}\.\d{4})")
+            elif field in ["Qty.", "Billed qty"]:
+                regex_parts.append(r"(\d+)")
+            elif field in ["Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST"]:
+                regex_parts.append(r"([\d,.]+)")
+            elif field == "AUD":
+                regex_parts.append(r"(AUD|NZD|USD)")
+            elif field == "Ignore":
+                regex_parts.append(re.escape(token))
+            else:  # Text fields
+                regex_parts.append(r"(.+?)")
 
-                if label == "Ignore":
-                    regex_parts.append(re.escape(token))
-                elif label == "Date":
-                    regex_parts.append(r"(\d{2}\.\d{2}\.\d{4})")
-                    group_index += 1
-                    field_map["Date"] = group_index
-                elif label == "Qty":
-                    regex_parts.append(r"([\d\.]+)")
-                    group_index += 1
-                    field_map["Qty."] = group_index
-                elif label == "Qty Unit":
-                    regex_parts.append(r"(\w+)")
-                    group_index += 1
-                    field_map["Billed qty"] = group_index
-                elif label == "Unit Price":
-                    regex_parts.append(r"([\d\.]+)")
-                    group_index += 1
-                    field_map["Unit Price"] = group_index
-                elif label == "Amount excl. GST":
-                    regex_parts.append(r"([\d,\.]+)")
-                    group_index += 1
-                    field_map["Amount excl. GST"] = group_index
-                elif label == "GST":
-                    regex_parts.append(r"([\d,\.]+)")
-                    group_index += 1
-                    field_map["GST"] = group_index
-                elif label == "Amount Incl. GST":
-                    regex_parts.append(r"([\d,\.]+)")
-                    group_index += 1
-                    field_map["Amount Incl. GST"] = group_index
-                elif label == "Reference":
-                    regex_parts.append(r"([\w\-\/\.]+)")
-                    group_index += 1
-                    field_map["Reference"] = group_index
-                elif label == "Description":
-                    regex_parts.append(r"(.+?)")
-                    group_index += 1
-                    field_map["Description"] = group_index
-                elif label == "Charge Type/Period Reference":
-                    regex_parts.append(r"(.+?)")
-                    group_index += 1
-                    field_map["Charge Type/Period Reference"] = group_index
-                elif label == "AUD":
-                    regex_parts.append(r"AUD")  # literal
+        final_regex = r"\s+".join(regex_parts)
+        token_pattern = " ".join(tokens)
 
-            final_regex = r"\s+".join(regex_parts)
+        if valid:
+            learned_patterns[token_pattern] = {
+                "regex": final_regex,
+                "field_map": field_map,
+                "Charge Type": "Auto-Learned"
+            }
+            save_learned_patterns(learned_patterns)
 
-            try:
-                compiled = re.compile(final_regex)
-                m = compiled.match(line)
-                if not m:
-                    st.warning("⚠️ Pattern didn’t match this example line. Not saved.")
-                else:
-                    valid = True
-                    for field, gi in field_map.items():
-                        if gi <= 0 or gi > len(m.groups()):
-                            st.warning(f"⚠️ Invalid mapping for `{field}` → group {gi}")
-                            valid = False
-                    if valid:
-                        learned_patterns[token_pattern] = {
-                            "regex": final_regex,
-                            "field_map": field_map,
-                            "Charge Type": "Auto-Learned"
-                        }
-                        save_learned_patterns(learned_patterns)
-                        st.success("✅ Pattern saved successfully!")
-                        st.code(final_regex, language="regex")
-                        st.json(field_map)
-
-
-            except re.error as e:
-                st.error(f"❌ Regex error: {e}")
+            # Confirmation output
+            st.success("✅ Pattern saved successfully!")
+            st.code(final_regex, language="regex")
+            st.json(field_map)
 # Pattern Management
 # -----------------------------
 # -----------------------------
 # Pattern Management (User Friendly + Test Tool)
 # -----------------------------
-def manage_patterns():
-    st.subheader("📚 Manage Learned Patterns")
+def manage_patterns(learned_patterns):
+    st.markdown("### 📚 Manage Learned Patterns")
 
     if not learned_patterns:
-        st.info("No saved patterns yet.")
+        st.info("No learned patterns available yet.")
         return
 
-    field_options = {
-    "--- Common Fields ---": "──────────────",
-    "Date": "📅 Date",
-    "Description": "📝 Description",
-    "Reference": "🔖 Reference",
-    "Charge Type/Period Reference": "📅 Charge / Period",
-    "Billed qty": "📊 Billed Quantity",
-    "Qty.": "🔢 Quantity",
-    "Qty Unit": "📦 Unit (EA, KG, TONNES)",
-    "Unit Price": "💲 Unit Price",
-    "Amount excl. GST": "💰 Net Amount",
-    "GST": "🧾 GST",
-    "Amount Incl. GST": "💲 Total Amount",
-    "AUD": "💲 AUD (currency)",
-    "Ignore": "❌ Ignore"
-    }
+    # Same field options for consistency
+    field_options = [
+        "Ignore", "Date", "Description", "Reference",
+        "Charge Type/Period Reference", "Billed qty", "Qty.",
+        "Qty Unit", "Unit Price", "Amount excl. GST",
+        "GST", "Amount Incl. GST", "AUD"
+    ]
 
+    for pattern, details in learned_patterns.items():
+        with st.expander(f"Pattern: {pattern}"):
+            st.code(details['regex'], language="regex")
 
-    for token_pattern, pattern_data in list(learned_patterns.items()):
-        with st.expander(f"🔑 Token Pattern: {token_pattern}"):
-
-            # Regex editor
-            st.markdown("**📝 Current Regex Pattern:**")
-            new_regex = st.text_area(
-                f"Edit Regex for {token_pattern}",
-                value=pattern_data.get("regex", ""),
-                height=80,
-                key=f"regex_{token_pattern}"
-            )
-
-            # Charge type
-            new_charge_type = st.text_input(
-                "Charge Type / Period Reference",
-                value=pattern_data.get("Charge Type", "Custom"),
-                key=f"charge_{token_pattern}"
-            )
-
-            # Field mapping
-            st.markdown("**🔗 Field Mapping (captured regex groups → invoice fields):**")
-            field_map = pattern_data.get("field_map", {})
+            # Editable field map
             new_field_map = {}
-            max_groups = max(field_map.values()) if field_map else 5  # assume 5 groups if none saved
-
-            for group_index in range(1, max_groups + 1):
-                current_field = None
-                for k, v in field_map.items():
-                    if v == group_index:
-                        current_field = k
-                        break
-
-                selection = st.selectbox(
-                    f"Group {group_index}",
+            for token, field in details['field_map'].items():
+                choice = st.selectbox(
+                    f"Map token `{token}`:",
                     field_options,
-                    index=field_options.index(current_field) if current_field in field_options else 0,
-                    key=f"{token_pattern}_group_{group_index}"
+                    index=field_options.index(field) if field in field_options else 0,
+                    key=f"manage_{pattern}_{token}"
                 )
+                new_field_map[token] = choice
 
-                if selection != "(ignore)":
-                    new_field_map[selection] = group_index
+            # Update button
+            if st.button("💾 Update Pattern", key=f"update_{pattern}"):
+                learned_patterns[pattern]['field_map'] = new_field_map
+                save_learned_patterns(learned_patterns)
+                st.success("Pattern updated successfully!")
 
-            # 🔍 Test Pattern
-            st.markdown("**🧪 Test Your Pattern**")
-            test_line = st.text_input(
-                "Paste a sample invoice line to test this regex",
-                "",
-                key=f"testline_{token_pattern}"
-            )
-            if st.button(f"▶️ Run Test ({token_pattern})"):
-                try:
-                    match = re.match(new_regex, test_line)
-                    if match:
-                        results = {}
-                        for field, group_idx in new_field_map.items():
-                            if group_idx <= len(match.groups()):
-                                results[field] = match.group(group_idx)
-                        if results:
-                            st.success("✅ Match Found!")
-                            st.json(results)
-                        else:
-                            st.warning("⚠️ Regex matched, but no fields were mapped.")
-                    else:
-                        st.error("❌ No match. Check your regex or sample line.")
-                except re.error as e:
-                    st.error(f"⚠️ Invalid regex: {e}")
+            # Delete button
+            if st.button("🗑 Delete Pattern", key=f"delete_{pattern}"):
+                del learned_patterns[pattern]
+                save_learned_patterns(learned_patterns)
+                st.warning("Pattern deleted!")
+                st.experimental_rerun()
 
-            # Save / Delete buttons
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button(f"💾 Save Changes ({token_pattern})"):
-                    learned_patterns[token_pattern]["regex"] = new_regex
-                    learned_patterns[token_pattern]["Charge Type"] = new_charge_type
-                    learned_patterns[token_pattern]["field_map"] = new_field_map
-                    save_learned_patterns(learned_patterns)
-                    st.success("✅ Pattern updated!")
-
-            with col2:
-                if st.button(f"🗑️ Delete Pattern ({token_pattern})"):
-                    del learned_patterns[token_pattern]
-                    save_learned_patterns(learned_patterns)
-                    st.warning("❌ Pattern deleted!")
-                    st.experimental_rerun()
 # -----------------------------
 # Streamlit UI
 # -----------------------------
