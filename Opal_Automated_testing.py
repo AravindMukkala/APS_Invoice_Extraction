@@ -686,6 +686,8 @@ if uploaded_file:
     # Pattern manager always available
     manage_patterns()
 
+        # Example usage
+    show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05)
 
     if totals:
         st.subheader("Invoice Totals")
