@@ -306,7 +306,7 @@ def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # ✅ Always include ALL lines in totals
+    # ✅ Always include all lines
     line_totals = {
         "Amount excl. GST": float(df["Amount excl. GST"].sum() if "Amount excl. GST" in df else 0),
         "GST": float(df["GST"].sum() if "GST" in df else 0),
@@ -326,23 +326,25 @@ def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
 
         comparison.append({
             "Field": field,
-            "From Invoice Footer": f"{expected:,.2f}",
-            "From ALL Lines (sum)": f"{actual:,.2f}",
+            "From Invoice": f"{expected:,.2f}",
+            "From Lines (sum)": f"{actual:,.2f}",
             "Difference": f"{diff:,.2f}",
-            "Status": "✅ Match" if within_tol else "❌ Mismatch"
+            "Status": "✅ OK" if within_tol else "❌ Mismatch"
         })
 
     # Show results
-    st.markdown("### 📋 Totals Comparison")
+    if all(row["Status"] == "✅ OK" for row in comparison):
+        st.success("✅ All line items (including manual/adjustments) add up to invoice totals!")
+    else:
+        st.error("⚠️ Differences found between line items and invoice totals.")
+
     st.dataframe(pd.DataFrame(comparison))
 
-    # ✅ Explicitly show what you consider the TRUE invoice total
-    st.success(f"✅ Total from ALL lines (your calculated invoice total): {line_totals['Amount Incl. GST']:,.2f}")
-
-    # Show line item breakdown
-    st.markdown("### 🔍 Line Item Breakdown")
+    # Show breakdown for clarity
+    st.markdown("### 🔍 Line Item Breakdown (all lines included)")
     cols_to_show = [c for c in ["Description", "Amount excl. GST", "GST", "Amount Incl. GST"] if c in df.columns]
     st.dataframe(df[cols_to_show])
+    st.info(f"➡️ Sum of 'Amount Incl. GST': {df['Amount Incl. GST'].sum():,.2f}")
 # -----------------------------
 # Learning widget
 # -----------------------------
