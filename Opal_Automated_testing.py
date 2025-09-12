@@ -340,6 +340,13 @@ def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
 
     st.dataframe(pd.DataFrame(comparison))
 
+    # 🔍 Show the raw line contributions for debugging
+    st.markdown("### 🔍 Line Item Breakdown")
+    cols_to_show = [c for c in ["Description", "Amount excl. GST", "GST", "Amount Incl. GST"] if c in df.columns]
+    st.dataframe(df[cols_to_show])
+    st.info(f"➡️ Sum of 'Amount Incl. GST': {df['Amount Incl. GST'].sum():,.2f}")
+
+
 # -----------------------------
 # Learning widget
 # -----------------------------
