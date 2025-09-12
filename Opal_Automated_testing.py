@@ -339,21 +339,8 @@ def show_learning_widget(missed_lines):
     except (FileNotFoundError, json.JSONDecodeError):
         learned_patterns = {}
 
-    field_options = {
-        "Ignore": "❌ Ignore this token",
-        "Date": "📅 Invoice Date (dd.mm.yyyy)",
-        "Description": "📝 Service / Item description",
-        "Reference": "🔖 Reference number or code",
-        "Qty": "🔢 Quantity value",
-        "Qty Unit": "📦 Unit of measure (e.g., EA, KG, TONNES)",
-        "Billed qty": "📊 Billed quantity from invoice",
-        "Unit Price": "💲 Price per unit",
-        "Amount excl. GST": "💰 Net amount (before tax)",
-        "GST": "🧾 Goods & Services Tax",
-        "Amount Incl. GST": "💲 Total amount (after tax)",
-        "Charge Type/Period Reference": "📅 Charge period (e.g., 01.01.2024 to 31.01.2024)",
-        "AUD": "💲 Currency AUD"
-    }
+    field_options = list(field_options.keys())   # reuse from widget
+
 
     for idx, ml in enumerate(missed_lines[:10]):
         st.markdown(f"**📄 Page {ml['Page']}, Line {ml['Line No.']}**")
@@ -378,18 +365,17 @@ def show_learning_widget(missed_lines):
                 confidence.append("🔵 Guessed")
 
         dropdowns = []
-        cols = st.columns(len(tokens))
         for i, token in enumerate(tokens):
-            with cols[i]:
-                choice = st.selectbox(
-                    f"{token} {confidence[i]}",
-                    list(field_options.keys()),
-                    index=list(field_options.keys()).index(suggested_fields[i])
-                        if suggested_fields[i] in field_options else 0,
-                    format_func=lambda x: field_options[x],
-                    key=f"dd_{idx}_{i}"
-                )
-                dropdowns.append(choice)
+        choice = st.selectbox(
+            f"Token: `{token}` {confidence[i]}",
+            list(field_options.keys()),
+            index=list(field_options.keys()).index(suggested_fields[i])
+                if suggested_fields[i] in field_options else 0,
+            format_func=lambda x: field_options[x],
+            key=f"dd_{idx}_{i}"
+        )
+        dropdowns.append(choice)
+
 
         # --- Save button (unchanged from fixed version) ---
         if st.button(f"💾 Save Mapping for Line {idx+1}", key=f"save_{idx}"):
@@ -466,6 +452,9 @@ def show_learning_widget(missed_lines):
                         }
                         save_learned_patterns(learned_patterns)
                         st.success("✅ Pattern saved successfully!")
+                        st.code(final_regex, language="regex")
+                        st.json(field_map)
+
 
             except re.error as e:
                 st.error(f"❌ Regex error: {e}")
@@ -481,10 +470,23 @@ def manage_patterns():
         st.info("No saved patterns yet.")
         return
 
-    field_options = [
-        "(ignore)", "Date", "Description", "Reference", "Charge Type/Period Reference",
-        "Billed qty", "Qty.", "Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST"
-    ]
+    field_options = {
+    "--- Common Fields ---": "──────────────",
+    "Date": "📅 Date",
+    "Description": "📝 Description",
+    "Reference": "🔖 Reference",
+    "Charge Type/Period Reference": "📅 Charge / Period",
+    "Billed qty": "📊 Billed Quantity",
+    "Qty.": "🔢 Quantity",
+    "Qty Unit": "📦 Unit (EA, KG, TONNES)",
+    "Unit Price": "💲 Unit Price",
+    "Amount excl. GST": "💰 Net Amount",
+    "GST": "🧾 GST",
+    "Amount Incl. GST": "💲 Total Amount",
+    "AUD": "💲 AUD (currency)",
+    "Ignore": "❌ Ignore"
+    }
+
 
     for token_pattern, pattern_data in list(learned_patterns.items()):
         with st.expander(f"🔑 Token Pattern: {token_pattern}"):
@@ -574,6 +576,8 @@ def manage_patterns():
 # -----------------------------
 st.set_page_config(page_title="Invoice PDF → Excel", layout="wide")
 st.title("📄 Invoice PDF → Excel Extractor")
+tab1, tab2, tab3 = st.tabs(["📂 Upload & Extract", "🧠 Teach Me", "📚 Manage Patterns"])
+
 
 uploaded_file = st.file_uploader("Upload an Invoice PDF", type=["pdf"])
 
