@@ -5,7 +5,10 @@ import pandas as pd
 import io
 
 # ========= Regex Patterns =========
-footer_pattern = re.compile(r"(Powered by wastedge\.com|Page:\s*\d+|Tax Invoice:|Invoice Date:|Acc:)", re.IGNORECASE)
+footer_pattern = re.compile(
+    r"(Powered by wastedge\.com|Page:\s*\d+|Tax Invoice:|Invoice Date:|Acc:)",
+    re.IGNORECASE
+)
 
 header_pattern = {
     "tax_invoice": r"Tax Invoice\s+(\d+)",
@@ -22,28 +25,28 @@ site_pattern = re.compile(
 
 # Primary pattern for service lines
 pattern = re.compile(
-    r"^(\d{2}/\d{2}/\d{2})\s+"      
-    r"([\d.]+)\s+"                  
-    r"(.+?)\s+"                     
-    r"(\d+)\s+"                     
-    r"([\d.,]+)\s+"                 
-    r"([\d.,]+)\s*"                 
-    r"(.*)$"                        
+    r"^(\d{2}/\d{2}/\d{2})\s+"        # Date
+    r"([\d.]+)\s+"                    # Ref No
+    r"(.+?)\s+"                       # Description
+    r"(\d+)\s+"                       # Qty
+    r"([\d.,]+)\s+"                   # Price
+    r"([\d.,]+)\s*"                   # Total
+    r"(.*)$"                          # Trailing desc
 )
 
 # Alternate pattern (decimal qty)
 pattern_alt = re.compile(
     r"""^
-    (\d{2}/\d{2}/\d{2})\s+           
-    ([\d.]+)\s+                       
-    (.+?)\s+                          
-    ([\d.]+)\s+                       
-    ([\d.,]+)\s+                      
-    ([\d.,]+)\s*                      
-    (.*)$                             
-    """, re.VERBOSE
+    (\d{2}/\d{2}/\d{2})\s+
+    ([\d.]+)\s+
+    (.+?)\s+
+    ([\d.]+)\s+
+    ([\d.,]+)\s+
+    ([\d.,]+)\s*
+    (.*)$
+    """,
+    re.VERBOSE
 )
-
 
 # ========= Functions =========
 def extract_pdf_text(pdf_bytes):
@@ -58,16 +61,16 @@ def extract_pdf_text(pdf_bytes):
 
 def extract_header(text):
     header_data = {}
-    for key, pattern in header_pattern.items():
-        match = re.search(pattern, text)
+    for key, pat in header_pattern.items():
+        match = re.search(pat, text)
         if match:
             header_data[key] = match.group(1).strip()
     return header_data
 
 
 def count_service_lines(text):
-    pattern = re.compile(r"^\d{2}/\d{2}/\d{2}", re.MULTILINE)
-    matches = pattern.findall(text)
+    pat = re.compile(r"^\d{2}/\d{2}/\d{2}", re.MULTILINE)
+    matches = pat.findall(text)
     return len(matches)
 
 
@@ -75,12 +78,11 @@ def parse_invoice(text):
     rows = []
     unmatched_rows = []
     header_data = extract_header(text)
-
     sites = list(site_pattern.finditer(text))
+
     for idx, site_match in enumerate(sites):
         site_code, customer_name, address, city, region, zipcode = site_match.groups()
         start_pos = site_match.end()
-
         if idx + 1 < len(sites):
             end_pos = sites[idx + 1].start()
             site_block = text[start_pos:end_pos]
@@ -89,7 +91,6 @@ def parse_invoice(text):
 
         lines = [l.strip() for l in site_block.split("\n") if l.strip()]
         i = 0
-
         while i < len(lines):
             if re.match(r"^\d{2}/\d{2}/\d{2}\s", lines[i]):
                 booking_lines = [lines[i]]
@@ -106,7 +107,6 @@ def parse_invoice(text):
                     j += 1
 
                 full_line = " ".join(booking_lines)
-
                 m = pattern.match(full_line)
                 if not m:
                     m = pattern_alt.match(full_line)
@@ -114,7 +114,6 @@ def parse_invoice(text):
                 if m:
                     date, ref_no, desc, qty, price, total, trailing_desc = m.groups()
                     description = (desc + " " + trailing_desc).strip()
-
                     rows.append({
                         "Tax Invoice": header_data.get("tax_invoice", ""),
                         "Site": site_code,
@@ -142,7 +141,6 @@ def parse_invoice(text):
                         "Zip": zipcode.strip(),
                         "Raw Line": full_line
                     })
-
                 i = j
             else:
                 i += 1
@@ -153,7 +151,6 @@ def parse_invoice(text):
 def parse_period_charges(text):
     period_rows = []
     period_blocks = re.split(r"Services / Site:", text)
-
     for block in period_blocks:
         if "Period Charges" in block:
             site_match = re.search(r"(\d+\.\d+)\s+Wasteflex Pty Ltd\s+-\s+(.+)", block)
@@ -161,6 +158,7 @@ def parse_period_charges(text):
                 continue
             site_code = site_match.group(1)
             customer_name_full = site_match.group(2).strip()
+
             if " - " in customer_name_full:
                 customer_name, address = customer_name_full.split(" - ", 1)
             else:
@@ -176,9 +174,7 @@ def parse_period_charges(text):
             if lines[start_idx].strip().startswith("Description"):
                 start_idx += 1
 
-            period_pattern = re.compile(
-                r"^(.+?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)$"
-            )
+            period_pattern = re.compile(r"^(.+?)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)$")
 
             for line in lines[start_idx:]:
                 line = line.strip()
@@ -234,51 +230,36 @@ if uploaded_file is not None:
     st.write(f"Unmatched lines: **{unmatched_line_count}**")
     st.write(f"Period Charges lines: **{len(period_charges)}**")
 
-    # ===== Invoice Validation (line-level rounding) =====
+    # ===== Invoice Validation =====
     try:
+        # Convert invoice header "Total" to float
         invoice_total = float(header_data.get("total", "0").replace(",", ""))
 
-        # Service lines
+        # Sum extracted line totals
         df_lines = pd.DataFrame(rows)
-        if not df_lines.empty:
-            df_lines["Line_Total_Rounded"] = (
-                df_lines["Qty"].astype(float) * df_lines["Price"].astype(float)
-            ).round(2)
-            service_lines_total = df_lines["Line_Total_Rounded"].sum()
-        else:
-            service_lines_total = 0.0
+        line_total_sum = df_lines["Total"].astype(float).sum() if not df_lines.empty else 0.0
 
-        # Period charges
+        # Include Period Charges totals if needed
         df_period = pd.DataFrame(period_charges)
         if not df_period.empty:
-            df_period["Line_Total_Rounded"] = (
-                df_period["Qty"].astype(float) * df_period["Price"].astype(float)
-            ).round(2)
-            period_charges_total = df_period["Line_Total_Rounded"].sum()
-        else:
-            period_charges_total = 0.0
-
-        # Subtotal (excl. GST)
-        subtotal = service_lines_total + period_charges_total
+            line_total_sum += df_period["Total"].astype(float).sum()
 
         # GST and Total incl. GST
-        gst_amount = round(subtotal * 0.10, 2)
-        calculated_total = round(subtotal + gst_amount, 2)
+        gst_amount = round(line_total_sum * 0.10, 2)
+        calculated_total = round(line_total_sum + gst_amount, 2)
 
-        # Validation Output
-        st.subheader("📊 Invoice Validation (Line-level Rounding)")
-        st.write(f"**Service Lines Total:** {service_lines_total:,.2f}")
-        st.write(f"**Period Charges Total:** {period_charges_total:,.2f}")
-        st.write(f"**Subtotal (excl. GST):** {subtotal:,.2f}")
+        st.subheader("📊 Invoice Validation")
+        st.write(f"**Service Lines Total:** {df_lines['Total'].astype(float).sum():,.2f}")
+        st.write(f"**Period Charges Total:** {df_period['Total'].astype(float).sum() if not df_period.empty else 0.00:,.2f}")
+        st.write(f"**Subtotal (excl. GST):** {line_total_sum:,.2f}")
         st.write(f"**GST (10%):** {gst_amount:,.2f}")
         st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
         st.write(f"**Invoice Total (from PDF):** {invoice_total:,.2f}")
 
-        diff = calculated_total - invoice_total
-        if abs(diff) < 0.01:
-            st.success("✅ Validation Passed (matches after line-level rounding)")
+        if abs(invoice_total - calculated_total) < 0.01:
+            st.success("✅ Validation Passed: Invoice total matches calculated total.")
         else:
-            st.error(f"❌ Validation Failed: Difference = {diff:,.2f}")
+            st.error(f"❌ Validation Failed: Difference = {invoice_total - calculated_total:,.2f}")
 
     except Exception as e:
         st.warning(f"⚠️ Could not validate invoice total: {e}")
