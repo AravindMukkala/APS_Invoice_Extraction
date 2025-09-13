@@ -62,10 +62,18 @@ def extract_pdf_text(pdf_bytes):
 def extract_header(text):
     header_data = {}
     for key, pat in header_pattern.items():
-        match = re.search(pat, text)
-        if match:
-            header_data[key] = match.group(1).strip()
+        if key == "total":
+            # Find all totals and sum them
+            matches = re.findall(pat, text)
+            if matches:
+                totals = [float(m.replace(",", "")) for m in matches]
+                header_data[key] = str(sum(totals))
+        else:
+            match = re.search(pat, text)
+            if match:
+                header_data[key] = match.group(1).strip()
     return header_data
+
 
 
 def count_service_lines(text):
