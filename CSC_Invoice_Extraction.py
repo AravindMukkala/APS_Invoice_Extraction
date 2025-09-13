@@ -58,6 +58,33 @@ def extract_pdf_text(pdf_bytes):
                 text += page_text + "\n"
     return text
 
+def extract_headers(text):
+    """
+    Extract all invoice headers from the PDF text.
+    Returns a list of dictionaries, each containing:
+    tax_invoice, account_number, billing_period, invoice_date, total
+    """
+    invoice_pattern = re.compile(
+        r"Tax Invoice\s+(\d+).*?"              # Tax Invoice
+        r"Account Number\s+([\d.]+).*?"       # Account Number
+        r"Billing Period\s+([\d/]+ to [\d/]+).*?"  # Billing Period
+        r"Invoice Date\s+([\d/]+).*?"         # Invoice Date
+        r"Total\s+([\d.,]+)",                  # Total (immediately after Invoice Date)
+        re.DOTALL
+    )
+
+    headers = []
+    for match in invoice_pattern.finditer(text):
+        tax_invoice, account_number, billing_period, invoice_date, total = match.groups()
+        headers.append({
+            "tax_invoice": tax_invoice.strip(),
+            "account_number": account_number.strip(),
+            "billing_period": billing_period.strip(),
+            "invoice_date": invoice_date.strip(),
+            "total": float(total.replace(",", "").strip())
+        })
+
+    return headers
 
 def extract_header(text):
     header_data = {}
@@ -219,7 +246,7 @@ if uploaded_file is not None:
     pdf_text = extract_pdf_text(pdf_bytes)
     rows, unmatched_rows = parse_invoice(pdf_text)
     period_charges = parse_period_charges(pdf_text)
-    header_data = extract_header(pdf_text)
+    headers = extract_headers(pdf_text)  # Updated: multiple invoice headers
 
     raw_line_count = count_service_lines(pdf_text)
     extracted_line_count = len(rows)
@@ -242,9 +269,8 @@ if uploaded_file is not None:
 
     # ===== Invoice Validation =====
     try:
-        # Convert summed invoice header "Total" to float
-        invoice_total = float(header_data.get("total", "0").replace(",", ""))
-        all_invoice_totals = header_data.get("all_totals", [])
+        # Sum of all invoice totals from PDF
+        total_invoice_sum = sum(h["total"] for h in headers)
 
         # Sum extracted line totals
         df_lines = pd.DataFrame(rows)
@@ -266,19 +292,20 @@ if uploaded_file is not None:
         st.write(f"**GST (10%):** {gst_amount:,.2f}")
         st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
 
-        if all_invoice_totals:
+        if headers:
             st.write("**Invoice Totals Found on PDF:**")
-            for idx, t in enumerate(all_invoice_totals, start=1):
-                st.write(f"Invoice {idx}: {t:,.2f}")
-            st.write(f"**Sum of Invoice Totals (for validation):** {invoice_total:,.2f}")
+            for idx, h in enumerate(headers, start=1):
+                st.write(f"Invoice {idx} ({h['tax_invoice']}): {h['total']:,.2f}")
+            st.write(f"**Sum of Invoice Totals (for validation):** {total_invoice_sum:,.2f}")
 
-        if abs(invoice_total - calculated_total) < 0.01:
+        if abs(total_invoice_sum - calculated_total) < 0.01:
             st.success("✅ Validation Passed: Invoice total matches calculated total.")
         else:
-            st.error(f"❌ Validation Failed: Difference = {invoice_total - calculated_total:,.2f}")
+            st.error(f"❌ Validation Failed: Difference = {total_invoice_sum - calculated_total:,.2f}")
 
     except Exception as e:
         st.warning(f"⚠️ Could not validate invoice total: {e}")
+
 
 
     # Show first few rows
