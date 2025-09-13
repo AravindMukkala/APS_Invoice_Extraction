@@ -242,43 +242,43 @@ if uploaded_file is not None:
 
     # ===== Invoice Validation =====
     try:
-    # Convert summed invoice header "Total" to float
-    invoice_total = float(header_data.get("total", "0").replace(",", ""))
-    all_invoice_totals = header_data.get("all_totals", [])
+        # Convert summed invoice header "Total" to float
+        invoice_total = float(header_data.get("total", "0").replace(",", ""))
+        all_invoice_totals = header_data.get("all_totals", [])
 
-    # Sum extracted line totals
-    df_lines = pd.DataFrame(rows)
-    line_total_sum = df_lines["Total"].astype(float).sum() if not df_lines.empty else 0.0
+        # Sum extracted line totals
+        df_lines = pd.DataFrame(rows)
+        line_total_sum = df_lines["Total"].astype(float).sum() if not df_lines.empty else 0.0
 
-    # Include Period Charges totals if needed
-    df_period = pd.DataFrame(period_charges)
-    if not df_period.empty:
-        line_total_sum += df_period["Total"].astype(float).sum()
+        # Include Period Charges totals if needed
+        df_period = pd.DataFrame(period_charges)
+        if not df_period.empty:
+            line_total_sum += df_period["Total"].astype(float).sum()
 
-    # GST and Total incl. GST
-    gst_amount = round(line_total_sum * 0.10, 2)
-    calculated_total = round(line_total_sum + gst_amount, 2)
+        # GST and Total incl. GST
+        gst_amount = round(line_total_sum * 0.10, 2)
+        calculated_total = round(line_total_sum + gst_amount, 2)
 
-    st.subheader("📊 Invoice Validation")
-    st.write(f"**Service Lines Total:** {df_lines['Total'].astype(float).sum():,.2f}")
-    st.write(f"**Period Charges Total:** {df_period['Total'].astype(float).sum() if not df_period.empty else 0.00:,.2f}")
-    st.write(f"**Subtotal (excl. GST):** {line_total_sum:,.2f}")
-    st.write(f"**GST (10%):** {gst_amount:,.2f}")
-    st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
+        st.subheader("📊 Invoice Validation")
+        st.write(f"**Service Lines Total:** {df_lines['Total'].astype(float).sum():,.2f}")
+        st.write(f"**Period Charges Total:** {df_period['Total'].astype(float).sum() if not df_period.empty else 0.00:,.2f}")
+        st.write(f"**Subtotal (excl. GST):** {line_total_sum:,.2f}")
+        st.write(f"**GST (10%):** {gst_amount:,.2f}")
+        st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
 
-    if all_invoice_totals:
-        st.write("**Invoice Totals Found on PDF:**")
-        for idx, t in enumerate(all_invoice_totals, start=1):
-            st.write(f"Invoice {idx}: {t:,.2f}")
-        st.write(f"**Sum of Invoice Totals (for validation):** {invoice_total:,.2f}")
+        if all_invoice_totals:
+            st.write("**Invoice Totals Found on PDF:**")
+            for idx, t in enumerate(all_invoice_totals, start=1):
+                st.write(f"Invoice {idx}: {t:,.2f}")
+            st.write(f"**Sum of Invoice Totals (for validation):** {invoice_total:,.2f}")
 
-    if abs(invoice_total - calculated_total) < 0.01:
-        st.success("✅ Validation Passed: Invoice total matches calculated total.")
-    else:
-        st.error(f"❌ Validation Failed: Difference = {invoice_total - calculated_total:,.2f}")
+        if abs(invoice_total - calculated_total) < 0.01:
+            st.success("✅ Validation Passed: Invoice total matches calculated total.")
+        else:
+            st.error(f"❌ Validation Failed: Difference = {invoice_total - calculated_total:,.2f}")
 
-except Exception as e:
-    st.warning(f"⚠️ Could not validate invoice total: {e}")
+    except Exception as e:
+        st.warning(f"⚠️ Could not validate invoice total: {e}")
 
 
     # Show first few rows
