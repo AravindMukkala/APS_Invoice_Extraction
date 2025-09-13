@@ -213,6 +213,7 @@ if uploaded_file is not None:
     pdf_text = extract_pdf_text(pdf_bytes)
     rows, unmatched_rows = parse_invoice(pdf_text)
     period_charges = parse_period_charges(pdf_text)
+    header_data = extract_header(pdf_text)
 
     raw_line_count = count_service_lines(pdf_text)
     extracted_line_count = len(rows)
@@ -226,18 +227,48 @@ if uploaded_file is not None:
         pd.DataFrame(period_charges).to_excel(writer, index=False, sheet_name="Period Charges")
     output_file.seek(0)
 
-    # Show results
+    # Show extraction results
     st.success("✅ Extraction complete!")
     st.write(f"Raw service lines found: **{raw_line_count}**")
     st.write(f"Extracted service lines: **{extracted_line_count}**")
     st.write(f"Unmatched lines: **{unmatched_line_count}**")
     st.write(f"Period Charges lines: **{len(period_charges)}**")
 
-    if extracted_line_count + unmatched_line_count < raw_line_count:
-        st.warning("⚠️ Some service lines may be missing!")
-    else:
-        st.info("✔️ All service lines accounted for in extraction or unmatched.")
+    # ===== Invoice Validation =====
+    # ===== Invoice Validation =====
+    try:
+        # Convert invoice header "Total" to float
+        invoice_total = float(header_data.get("total", "0").replace(",", ""))
 
+        # Sum extracted line totals
+        df_lines = pd.DataFrame(rows)
+        line_total_sum = df_lines["Total"].astype(float).sum() if not df_lines.empty else 0.0
+
+        # Include Period Charges totals if needed
+        df_period = pd.DataFrame(period_charges)
+        if not df_period.empty:
+            line_total_sum += df_period["Total"].astype(float).sum()
+
+        # GST and Total incl. GST
+        gst_amount = round(line_total_sum * 0.10, 2)
+        calculated_total = round(line_total_sum + gst_amount, 2)
+
+        # Compare with invoice total
+        st.subheader("📊 Invoice Validation")
+        st.write(f"**Subtotal (excl. GST):** {line_total_sum:,.2f}")
+        st.write(f"**GST (10%):** {gst_amount:,.2f}")
+        st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
+        st.write(f"**Invoice Total (from PDF):** {invoice_total:,.2f}")
+
+        if abs(invoice_total - calculated_total) < 0.01:
+            st.success("✅ Validation Passed: Invoice total matches calculated total.")
+        else:
+            st.error(f"❌ Validation Failed: Difference = {invoice_total - calculated_total:,.2f}")
+    except Exception as e:
+        st.warning(f"⚠️ Could not validate invoice total: {e}")
+
+
+    # Show first few rows
     if extracted_line_count > 0:
         st.dataframe(pd.DataFrame(rows).head())
 
@@ -248,3 +279,4 @@ if uploaded_file is not None:
         file_name="CSC_invoice_EXTRACTED.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
