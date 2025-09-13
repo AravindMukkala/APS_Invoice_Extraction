@@ -253,12 +253,14 @@ if uploaded_file is not None:
         gst_amount = round(line_total_sum * 0.10, 2)
         calculated_total = round(line_total_sum + gst_amount, 2)
 
-        # Compare with invoice total
         st.subheader("📊 Invoice Validation")
+        st.write(f"**Service Lines Total:** {df_lines['Total'].astype(float).sum():,.2f}")
+        st.write(f"**Period Charges Total:** {df_period['Total'].astype(float).sum() if not df_period.empty else 0.00:,.2f}")
         st.write(f"**Subtotal (excl. GST):** {line_total_sum:,.2f}")
         st.write(f"**GST (10%):** {gst_amount:,.2f}")
         st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
         st.write(f"**Invoice Total (from PDF):** {invoice_total:,.2f}")
+
 
         if abs(invoice_total - calculated_total) < 0.01:
             st.success("✅ Validation Passed: Invoice total matches calculated total.")
