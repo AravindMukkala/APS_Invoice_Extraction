@@ -22,13 +22,13 @@ site_pattern = re.compile(
 
 # Primary pattern for service lines
 pattern = re.compile(
-    r"^(\d{2}/\d{2}/\d{2})\s+"      # Date
-    r"([\d.]+)\s+"                  # Ref No
-    r"(.+?)\s+"                     # Description
-    r"(\d+)\s+"                     # Qty
-    r"([\d.,]+)\s+"                 # Price
-    r"([\d.,]+)\s*"                 # Total
-    r"(.*)$"                        # Trailing desc
+    r"^(\d{2}/\d{2}/\d{2})\s+"      
+    r"([\d.]+)\s+"                  
+    r"(.+?)\s+"                     
+    r"(\d+)\s+"                     
+    r"([\d.,]+)\s+"                 
+    r"([\d.,]+)\s*"                 
+    r"(.*)$"                        
 )
 
 # Alternate pattern (decimal qty)
@@ -234,41 +234,54 @@ if uploaded_file is not None:
     st.write(f"Unmatched lines: **{unmatched_line_count}**")
     st.write(f"Period Charges lines: **{len(period_charges)}**")
 
-    # ===== Invoice Validation =====
-    # ===== Invoice Validation =====
+    # ===== Invoice Validation (line-level rounding) =====
     try:
-        # Convert invoice header "Total" to float
         invoice_total = float(header_data.get("total", "0").replace(",", ""))
 
-        # Sum extracted line totals
+        # Service lines
         df_lines = pd.DataFrame(rows)
-        line_total_sum = df_lines["Total"].astype(float).sum() if not df_lines.empty else 0.0
+        if not df_lines.empty:
+            df_lines["Line_Total_Rounded"] = (
+                df_lines["Qty"].astype(float) * df_lines["Price"].astype(float)
+            ).round(2)
+            service_lines_total = df_lines["Line_Total_Rounded"].sum()
+        else:
+            service_lines_total = 0.0
 
-        # Include Period Charges totals if needed
+        # Period charges
         df_period = pd.DataFrame(period_charges)
         if not df_period.empty:
-            line_total_sum += df_period["Total"].astype(float).sum()
+            df_period["Line_Total_Rounded"] = (
+                df_period["Qty"].astype(float) * df_period["Price"].astype(float)
+            ).round(2)
+            period_charges_total = df_period["Line_Total_Rounded"].sum()
+        else:
+            period_charges_total = 0.0
+
+        # Subtotal (excl. GST)
+        subtotal = service_lines_total + period_charges_total
 
         # GST and Total incl. GST
-        gst_amount = round(line_total_sum * 0.10, 2)
-        calculated_total = round(line_total_sum + gst_amount, 2)
+        gst_amount = round(subtotal * 0.10, 2)
+        calculated_total = round(subtotal + gst_amount, 2)
 
-        st.subheader("📊 Invoice Validation")
-        st.write(f"**Service Lines Total:** {df_lines['Total'].astype(float).sum():,.2f}")
-        st.write(f"**Period Charges Total:** {df_period['Total'].astype(float).sum() if not df_period.empty else 0.00:,.2f}")
-        st.write(f"**Subtotal (excl. GST):** {line_total_sum:,.2f}")
+        # Validation Output
+        st.subheader("📊 Invoice Validation (Line-level Rounding)")
+        st.write(f"**Service Lines Total:** {service_lines_total:,.2f}")
+        st.write(f"**Period Charges Total:** {period_charges_total:,.2f}")
+        st.write(f"**Subtotal (excl. GST):** {subtotal:,.2f}")
         st.write(f"**GST (10%):** {gst_amount:,.2f}")
         st.write(f"**Calculated Total (incl. GST):** {calculated_total:,.2f}")
         st.write(f"**Invoice Total (from PDF):** {invoice_total:,.2f}")
 
-
-        if abs(invoice_total - calculated_total) < 0.01:
-            st.success("✅ Validation Passed: Invoice total matches calculated total.")
+        diff = calculated_total - invoice_total
+        if abs(diff) < 0.01:
+            st.success("✅ Validation Passed (matches after line-level rounding)")
         else:
-            st.error(f"❌ Validation Failed: Difference = {invoice_total - calculated_total:,.2f}")
+            st.error(f"❌ Validation Failed: Difference = {diff:,.2f}")
+
     except Exception as e:
         st.warning(f"⚠️ Could not validate invoice total: {e}")
-
 
     # Show first few rows
     if extracted_line_count > 0:
@@ -281,4 +294,3 @@ if uploaded_file is not None:
         file_name="CSC_invoice_EXTRACTED.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
