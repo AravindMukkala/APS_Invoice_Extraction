@@ -1,15 +1,34 @@
+import os
 import fitz  # PyMuPDF
 import re
 import pandas as pd
 import streamlit as st
 from io import BytesIO
 
-
 # ---------------------------
 # Extract text from PDF
 # ---------------------------
-def extract_text_from_pdf(file):
-    doc = fitz.open(stream=file.read(), filetype="pdf")
+def extract_text_from_pdf(pdf_input):
+    """
+    Accepts either:
+      - a filesystem path (str / os.PathLike)
+      - a file-like object (BytesIO / streamlit UploadedFile)
+      - raw bytes
+    Returns list of page texts (same shape as original script).
+    """
+    # path-like input
+    if isinstance(pdf_input, (str, os.PathLike)):
+        doc = fitz.open(str(pdf_input))
+    else:
+        # file-like or bytes: make sure we pass bytes to fitz
+        if hasattr(pdf_input, "read"):
+            data = pdf_input.read()
+        else:
+            data = pdf_input
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        doc = fitz.open(stream=data, filetype="pdf")
+
     return [page.get_text("text") for page in doc]
 
 
@@ -21,8 +40,10 @@ def extract_customer_address(text):
     lines = text.splitlines()
     customer, address = "", ""
 
+    # Site address block usually appears after invoice header
     for i, line in enumerate(lines):
         if line.strip().upper().startswith("SITE ADDRESS") and i + 1 < len(lines):
+            # capture next 2–3 lines as address
             addr_lines = []
             for j in range(i + 1, len(lines)):
                 next_line = lines[j].strip()
@@ -36,6 +57,7 @@ def extract_customer_address(text):
             customer = lines[i + 1].strip() if addr_lines else ""
             return customer, address
 
+    # fallback: detect customer name + address in top block
     cust_addr_match = re.search(
         r"([A-Za-z0-9 \-/&]+)\n([\d]+ .+?\s(?:VIC|TAS|NSW|QLD|WA|SA|NT|ACT)\s*\d{3,4})",
         text,
@@ -57,16 +79,24 @@ def split_reference_and_service(desc):
 
     first, rest = tokens[0], tokens[1] if len(tokens) > 1 else ""
 
+    # Case 1: explicit CASE references
     if re.match(r"CASE[:\-]?\d+", first, re.I):
         return first, rest
+
+    # Case 2: pure numeric with >=3 digits
     if first.isdigit() and len(first) >= 3:
         return first, rest
+
+    # Case 3: alphanumeric containing digits, length >=5
     if any(c.isdigit() for c in first) and len(first) >= 5:
         return first, rest
+
+    # Otherwise → treat whole thing as Service Provided
     return "", desc
 
 
 def clean_amount(value):
+    """Remove $ and commas, return float if possible."""
     if not value:
         return None
     try:
@@ -79,8 +109,10 @@ def parse_invoice_lines(block_text, header_data):
     lines = [l.strip() for l in block_text.splitlines() if l.strip()]
     line_items, current = [], []
 
+    # group lines by date-start
     for l in lines:
         if re.match(r"\d{2}/\d{2}/\d{2,4}", l):
+            # new line item starts with a date
             if current:
                 line_items.append(current)
             current = [l]
@@ -92,8 +124,13 @@ def parse_invoice_lines(block_text, header_data):
     records = []
     for item in line_items:
         text = " ".join(item)
+
+        # 🔧 FIX: join split decimals like "2,700." "02" → "2,700.02"
         text = re.sub(r"(\d{1,3}(?:,\d{3})*)\.\s*(\d{2})", r"\1.\2", text)
 
+        # ------------------------
+        # Case 1: With Quantity + Amount
+        # ------------------------
         m = re.match(
             r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(\d{1,6}(?:\.\d{1,2})?)\s+\$?\s*([\d,]+\.\d{2})",
             text,
@@ -105,28 +142,48 @@ def parse_invoice_lines(block_text, header_data):
             )
         if m:
             ref, service = split_reference_and_service(m.group(2))
-            records.append({**header_data,
-                "Service Date": m.group(1),
-                "Reference": ref,
-                "Service Provided": service,
-                "Quantity": m.group(3),
-                "Amount": clean_amount(m.group(4))})
+            records.append(
+                {
+                    **header_data,
+                    "Service Date": m.group(1),
+                    "Reference": ref,
+                    "Service Provided": service,
+                    "Quantity": m.group(3),
+                    "Amount": clean_amount(m.group(4)),
+                }
+            )
             continue
 
+        # ------------------------
+        # Case 2: Amount only (no Quantity)
+        # ------------------------
         m = re.match(r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+\$?([\d,]+\.\d{2})", text)
         if not m:
-            m = re.match(r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+\$?\s*([\d.,]+)", text)
+            m = re.match(
+                r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+\$?\s*([\d.,]+)",
+                text,
+            )
         if m:
             ref, service = split_reference_and_service(m.group(2))
-            records.append({**header_data,
-                "Service Date": m.group(1),
-                "Reference": ref,
-                "Service Provided": service,
-                "Quantity": "",
-                "Amount": clean_amount(m.group(3))})
+            records.append(
+                {
+                    **header_data,
+                    "Service Date": m.group(1),
+                    "Reference": ref,
+                    "Service Provided": service,
+                    "Quantity": "",
+                    "Amount": clean_amount(m.group(3)),
+                }
+            )
             continue
 
-        m = re.match(r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(\d{1,6}(?:\.\d{1,2})?)$", text)
+        # ------------------------
+        # Case 3: With Quantity but missing Amount
+        # ------------------------
+        m = re.match(
+            r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(\d{1,6}(?:\.\d{1,2})?)$",
+            text,
+        )
         if m:
             ref, service = split_reference_and_service(m.group(2))
             next_amount = ""
@@ -134,18 +191,26 @@ def parse_invoice_lines(block_text, header_data):
                 maybe_amount = item[-1].replace("$", "").replace(",", "").strip()
                 if re.match(r"^\d+(?:\.\d{2})?$", maybe_amount):
                     next_amount = maybe_amount
-            records.append({**header_data,
-                "Service Date": m.group(1),
-                "Reference": ref,
-                "Service Provided": service,
-                "Quantity": m.group(3),
-                "Amount": clean_amount(next_amount)})
+            records.append(
+                {
+                    **header_data,
+                    "Service Date": m.group(1),
+                    "Reference": ref,
+                    "Service Provided": service,
+                    "Quantity": m.group(3),
+                    "Amount": clean_amount(next_amount),
+                }
+            )
             continue
 
     return records
 
 
+# ---------------------------
+# Parse invoice page
+# ---------------------------
 def parse_invoice(text, prev_header=None):
+    """Parse one invoice page with possibly multiple site blocks."""
     header_patterns = {
         "Tax Invoice": r"Tax Invoice\s+(\d+)",
         "Invoice Date": r"Invoice Date\s+([\d/]+)",
@@ -156,9 +221,12 @@ def parse_invoice(text, prev_header=None):
         "Payment Due": r"Payment due by\s+([\d/]+)",
     }
 
-    header_data = {f: (m.group(1).strip() if (m := re.search(p, text, re.I)) else "")
-                   for f, p in header_patterns.items()}
+    header_data = {
+        f: (m.group(1).strip() if (m := re.search(p, text, re.I)) else "")
+        for f, p in header_patterns.items()
+    }
 
+    # carry headers if continued
     if prev_header:
         for key, val in header_data.items():
             if not val:
@@ -166,12 +234,15 @@ def parse_invoice(text, prev_header=None):
 
     records = []
 
+    # find ALL site blocks
     for block in re.finditer(
         r"Date\s+(?:Reference\s+)?Service Provided(.+?)(?:Site\s+Total|continued overleaf|Total\s+Inc|GST\s+|\Z)",
         text,
         re.S | re.I,
     ):
         block_text = block.group(1).strip()
+
+        # try to find the site address right before this block
         before = text[: block.start()].splitlines()[-8:]
         cust, addr = "", ""
         for i in range(len(before)):
@@ -182,18 +253,24 @@ def parse_invoice(text, prev_header=None):
                 break
 
         header_data["Customer"], header_data["Address"] = cust, addr
+
+        # parse line items inside this block
         block_records = parse_invoice_lines(block_text, header_data)
         records.extend(block_records)
 
     return records, header_data
 
 
+# ---------------------------
+# Validation
+# ---------------------------
 def validate_invoices(df):
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-    validation_records, mismatched_lines = [], []
+    validation_records = []
+    mismatched_lines = []
 
     for inv, group in df.groupby("Tax Invoice"):
         sum_amount = group["Amount"].sum()
@@ -210,14 +287,16 @@ def validate_invoices(df):
         if reported_total and abs(calc_total_inc - reported_total) >= 1.00:
             status = "MISMATCH"
 
-        validation_records.append({
-            "Tax Invoice": inv,
-            "Extracted Sum": round(sum_amount, 2),
-            "Expected GST (10%)": expected_gst,
-            "Calculated Total Inc GST": calc_total_inc,
-            "Reported Total Inc GST": reported_total,
-            "Status": status,
-        })
+        validation_records.append(
+            {
+                "Tax Invoice": inv,
+                "Extracted Sum": round(sum_amount, 2),
+                "Expected GST (10%)": expected_gst,
+                "Calculated Total Inc GST": calc_total_inc,
+                "Reported Total Inc GST": reported_total,
+                "Status": status,
+            }
+        )
 
         if status == "MISMATCH":
             mismatched_lines.extend(group.to_dict(orient="records"))
@@ -226,16 +305,27 @@ def validate_invoices(df):
 
 
 # ---------------------------
-# STREAMLIT APP
+# STREAMLIT APP (minimal wrapper — original parsing logic unchanged)
 # ---------------------------
-st.set_page_config(page_title="Invoice Parser", layout="wide")
-st.title("📄 Invoice Parser NEW VEOLIA(Suez)")
+st.set_page_config(page_title="NEW VEOLIA(SUEZ) Invoice Parser", layout="wide")
+st.title("📄 Invoice Parser NEW VEOLIA(SUEZ)")
 
 uploaded_file = st.file_uploader("Upload a PDF Invoice", type=["pdf"])
+show_raw = st.checkbox("Show raw extracted text (helpful for debugging)", value=False)
 
 if uploaded_file:
-    texts = extract_text_from_pdf(uploaded_file)
-    all_records, prev_header = [], None
+    # read bytes once and re-use so parsing behaves deterministically
+    uploaded_bytes = uploaded_file.read()
+    texts = extract_text_from_pdf(BytesIO(uploaded_bytes))
+
+    if show_raw:
+        st.subheader("Raw page texts")
+        for i, t in enumerate(texts, start=1):
+            st.markdown(f"**Page {i}**")
+            st.text(t[:1000] + ("..." if len(t) > 1000 else ""))
+
+    all_records = []
+    prev_header = None
 
     for page_text in texts:
         records, prev_header = parse_invoice(page_text, prev_header)
@@ -254,7 +344,7 @@ if uploaded_file:
         st.subheader("Mismatched Lines")
         st.dataframe(mismatched_df)
 
-    # Export to Excel for download
+    # Export all to Excel for download
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         if not df.empty:
@@ -269,3 +359,7 @@ if uploaded_file:
         file_name="invoices_output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+    st.success(f"✅ Extracted {len(df)} line items")
+else:
+    st.info("Upload a single PDF invoice to parse.")
