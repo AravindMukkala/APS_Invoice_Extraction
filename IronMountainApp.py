@@ -40,7 +40,7 @@ def parse_invoice(pdf_bytes):
     service_address_pattern = re.compile(r"Service Address:\s*(.+)")
     order_no_pattern = re.compile(r"IM Order No\.\:\s*([A-Z0-9]+)")
     charge_line_pattern = re.compile(
-        r"(SS:.*?)\s+(\d{2}/\d{2}/\d{4})?\s+([A-Z]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
+        r"(.+?)\s+(\d{2}/\d{2}/\d{4})?\s+([A-Z]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)"
     )
     subtotal_pattern = re.compile(r"SUBTOTAL:\s*\$?([\d,]+\.\d{2})", re.IGNORECASE)
 
