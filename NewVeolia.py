@@ -87,7 +87,6 @@ def parse_invoice_lines(block_text, header_data):
         line_items.append(current)
 
     records = []
-    unmatched = []
     for item in line_items:
         text = " ".join(item)
         text = re.sub(r"(\d{1,3}(?:,\d{3})*)\.\s*(\d{2})", r"\1.\2", text)
@@ -148,11 +147,7 @@ def parse_invoice_lines(block_text, header_data):
                  "Amount": clean_amount(next_amount)}
             )
             continue
-
-        # ❌ If nothing matched → add to unmatched
-        unmatched.append({"Unmatched Line": text, **header_data})
-
-    return records, unmatched
+    return records
 
 # ---------------------------
 # Parse invoice page
@@ -179,7 +174,6 @@ def parse_invoice(text, prev_header=None):
                 header_data[key] = prev_header.get(key, "")
 
     records = []
-    unmatched = []
     for block in re.finditer(
         r"Date\s+(?:Reference\s+)?Service Provided(.+?)(?:Site\s+Total|continued overleaf|Total\s+Inc|GST\s+|\Z)",
         text,
@@ -196,11 +190,10 @@ def parse_invoice(text, prev_header=None):
                 break
 
         header_data["Customer"], header_data["Address"] = cust, addr
-        block_records, block_unmatched = parse_invoice_lines(block_text, header_data)
+        block_records = parse_invoice_lines(block_text, header_data)
         records.extend(block_records)
-        unmatched.extend(block_unmatched)
 
-    return records, unmatched, header_data
+    return records, header_data
 
 # ---------------------------
 # Validation
@@ -255,16 +248,13 @@ uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
 if uploaded_file:
     texts = extract_text_from_pdf(uploaded_file)
     all_records = []
-    all_unmatched = []
     prev_header = None
 
     for page_text in texts:
-        records, unmatched, prev_header = parse_invoice(page_text, prev_header)
+        records, prev_header = parse_invoice(page_text, prev_header)
         all_records.extend(records)
-        all_unmatched.extend(unmatched)
 
     df = pd.DataFrame(all_records)
-    unmatched_df = pd.DataFrame(all_unmatched)
     validation_df, mismatched_df = validate_invoices(df)
 
     st.subheader("📊 Extracted Line Items")
@@ -277,10 +267,6 @@ if uploaded_file:
         st.subheader("⚠️ Mismatched Lines")
         st.dataframe(mismatched_df, use_container_width=True)
 
-    if not unmatched_df.empty:
-        st.subheader("🔎 Unmatched Lines (Check Parsing Rules)")
-        st.dataframe(unmatched_df, use_container_width=True)
-
     # Excel Export
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -290,7 +276,4 @@ if uploaded_file:
             validation_df.to_excel(writer, sheet_name="Validation", index=False)
         if not mismatched_df.empty:
             mismatched_df.to_excel(writer, sheet_name="Mismatched_Lines", index=False)
-        if not unmatched_df.empty:
-            unmatched_df.to_excel(writer, sheet_name="Unmatched_Lines", index=False)
-
     st.download_button("📥 Download Excel", data=output.getvalue(), file_name="invoices_output.xlsx")
