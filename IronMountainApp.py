@@ -5,10 +5,22 @@ import re
 import streamlit as st
 
 # ----------------------------
-# Streamlit UI
+# Streamlit Page Config
 # ----------------------------
 st.set_page_config(page_title="Invoice PDF Parser", layout="wide")
+
 st.title("📄 Iron Mountain Invoice Parser")
+st.markdown(
+    """
+    Upload an **invoice PDF** and this app will:
+    - Extract charges, accounts, and subtotals  
+    - Highlight mismatches between parsed totals and invoice subtotals  
+    - Show any unparsed `SS:` lines separately  
+    - Let you **download an Excel file** with all results  
+
+    👉 Start by uploading your PDF below.
+    """
+)
 
 uploaded_file = st.file_uploader("Upload an Invoice PDF", type=["pdf"])
 
@@ -16,8 +28,6 @@ uploaded_file = st.file_uploader("Upload an Invoice PDF", type=["pdf"])
 # Function to parse PDF
 # ----------------------------
 def parse_invoice(pdf_bytes):
-    st.info("Parsing PDF... Please wait.")
-
     parsed_data = []
     all_lines = []
     parsed_lines = set()
@@ -125,9 +135,7 @@ def parse_invoice(pdf_bytes):
                     invoice_subtotals[invoice_number] = float(m.group(1).replace(",", ""))
                     ignore_ss_after_list_of_charges = False
 
-    # ----------------------------
     # Convert to DataFrame
-    # ----------------------------
     df = pd.DataFrame(parsed_data)
     if not df.empty:
         df["Amount"] = df["Amount"].astype(float)
@@ -143,43 +151,7 @@ def parse_invoice(pdf_bytes):
     ]
     unmatched_df = pd.DataFrame(unmatched_lines, columns=["Unparsed Line"])
 
-    # ----------------------------
-    # Display results
-    # ----------------------------
-    st.success(f"Extraction complete. {len(df)} rows parsed.")
-
-    # Show summary
-    for inv, subtotal in invoice_subtotals.items():
-        parsed_inv_total = df[df['Invoice Number'] == inv]['Amount'].sum()
-        st.write(f"**Invoice {inv}**: Parsed Total = {parsed_inv_total}, Subtotal = {subtotal}")
-        if abs(parsed_inv_total - subtotal) > 0.01:
-            st.warning(f"⚠️ WARNING: Invoice {inv} total mismatch!")
-
-    if not unmatched_df.empty:
-        st.warning(f"{len(unmatched_df)} potential charge lines were not parsed.")
-
-    # Download Excel
-    output_file = io.BytesIO()
-    with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
-        df.to_excel(writer, sheet_name="Parsed Data", index=False)
-        unmatched_df.to_excel(writer, sheet_name="Unmatched Lines", index=False)
-    output_file.seek(0)
-
-    st.download_button(
-        label="📥 Download Parsed Excel",
-        data=output_file,
-        file_name="invoice_data_ironMountain.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-    # Display tables
-    if not df.empty:
-        st.subheader("Parsed Data Preview")
-        st.dataframe(df.head(50))
-
-    if not unmatched_df.empty:
-        st.subheader("Unmatched Lines Preview")
-        st.dataframe(unmatched_df.head(50))
+    return df, unmatched_df, invoice_subtotals
 
 
 # ----------------------------
@@ -187,4 +159,56 @@ def parse_invoice(pdf_bytes):
 # ----------------------------
 if uploaded_file is not None:
     pdf_bytes = uploaded_file.read()
-    parse_invoice(pdf_bytes)
+    df, unmatched_df, invoice_subtotals = parse_invoice(pdf_bytes)
+
+    st.success(f"✅ Extraction complete. {len(df)} rows parsed.")
+
+    # Invoice Totals Section
+    with st.expander("📑 Invoice Totals Check", expanded=True):
+        for inv, subtotal in invoice_subtotals.items():
+            parsed_inv_total = df[df['Invoice Number'] == inv]['Amount'].sum()
+            if abs(parsed_inv_total - subtotal) > 0.01:
+                st.error(f"Invoice {inv}: Parsed = {parsed_inv_total}, Expected = {subtotal}")
+            else:
+                st.success(f"Invoice {inv}: ✅ Totals match ({subtotal})")
+
+    # Tabs for results
+    tab1, tab2, tab3 = st.tabs(["📊 Parsed Data", "⚠️ Unmatched Lines", "📥 Download"])
+
+    with tab1:
+        if not df.empty:
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No parsed data found.")
+
+    with tab2:
+        if not unmatched_df.empty:
+            st.dataframe(unmatched_df, use_container_width=True)
+        else:
+            st.success("No unmatched lines 🎉")
+
+    with tab3:
+        output_file = io.BytesIO()
+        with pd.ExcelWriter(output_file, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="Parsed Data", index=False)
+            unmatched_df.to_excel(writer, sheet_name="Unmatched Lines", index=False)
+        output_file.seek(0)
+
+        st.download_button(
+            label="📥 Download Excel",
+            data=output_file,
+            file_name="invoice_data_ironMountain.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+# ----------------------------
+# Hide Streamlit branding
+# ----------------------------
+hide_st_style = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+"""
+st.markdown(hide_st_style, unsafe_allow_html=True)
