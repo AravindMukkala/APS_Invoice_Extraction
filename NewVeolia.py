@@ -1,8 +1,9 @@
-import streamlit as st
 import fitz  # PyMuPDF
 import re
 import pandas as pd
+import streamlit as st
 from io import BytesIO
+
 
 # ---------------------------
 # Extract text from PDF
@@ -11,10 +12,12 @@ def extract_text_from_pdf(file):
     doc = fitz.open(stream=file.read(), filetype="pdf")
     return [page.get_text("text") for page in doc]
 
+
 # ---------------------------
 # Extract Customer & Address
 # ---------------------------
 def extract_customer_address(text):
+    """Prefer SECOND block (site address), fallback to FIRST block."""
     lines = text.splitlines()
     customer, address = "", ""
 
@@ -42,6 +45,7 @@ def extract_customer_address(text):
         address = cust_addr_match.group(2).replace("\n", ", ").strip()
     return customer, address
 
+
 # ---------------------------
 # Split Reference vs Service
 # ---------------------------
@@ -61,6 +65,7 @@ def split_reference_and_service(desc):
         return first, rest
     return "", desc
 
+
 def clean_amount(value):
     if not value:
         return None
@@ -69,9 +74,7 @@ def clean_amount(value):
     except Exception:
         return None
 
-# ---------------------------
-# Parse invoice lines
-# ---------------------------
+
 def parse_invoice_lines(block_text, header_data):
     lines = [l.strip() for l in block_text.splitlines() if l.strip()]
     line_items, current = [], []
@@ -91,7 +94,6 @@ def parse_invoice_lines(block_text, header_data):
         text = " ".join(item)
         text = re.sub(r"(\d{1,3}(?:,\d{3})*)\.\s*(\d{2})", r"\1.\2", text)
 
-        # Case 1: With Quantity + Amount
         m = re.match(
             r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(\d{1,6}(?:\.\d{1,2})?)\s+\$?\s*([\d,]+\.\d{2})",
             text,
@@ -103,33 +105,27 @@ def parse_invoice_lines(block_text, header_data):
             )
         if m:
             ref, service = split_reference_and_service(m.group(2))
-            records.append(
-                {**header_data,
-                 "Service Date": m.group(1),
-                 "Reference": ref,
-                 "Service Provided": service,
-                 "Quantity": m.group(3),
-                 "Amount": clean_amount(m.group(4))}
-            )
+            records.append({**header_data,
+                "Service Date": m.group(1),
+                "Reference": ref,
+                "Service Provided": service,
+                "Quantity": m.group(3),
+                "Amount": clean_amount(m.group(4))})
             continue
 
-        # Case 2: Amount only (no Quantity)
         m = re.match(r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+\$?([\d,]+\.\d{2})", text)
         if not m:
             m = re.match(r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+\$?\s*([\d.,]+)", text)
         if m:
             ref, service = split_reference_and_service(m.group(2))
-            records.append(
-                {**header_data,
-                 "Service Date": m.group(1),
-                 "Reference": ref,
-                 "Service Provided": service,
-                 "Quantity": "",
-                 "Amount": clean_amount(m.group(3))}
-            )
+            records.append({**header_data,
+                "Service Date": m.group(1),
+                "Reference": ref,
+                "Service Provided": service,
+                "Quantity": "",
+                "Amount": clean_amount(m.group(3))})
             continue
 
-        # Case 3: With Quantity but missing Amount
         m = re.match(r"(\d{2}/\d{2}/\d{2,4})\s+(.+?)\s+(\d{1,6}(?:\.\d{1,2})?)$", text)
         if m:
             ref, service = split_reference_and_service(m.group(2))
@@ -138,20 +134,17 @@ def parse_invoice_lines(block_text, header_data):
                 maybe_amount = item[-1].replace("$", "").replace(",", "").strip()
                 if re.match(r"^\d+(?:\.\d{2})?$", maybe_amount):
                     next_amount = maybe_amount
-            records.append(
-                {**header_data,
-                 "Service Date": m.group(1),
-                 "Reference": ref,
-                 "Service Provided": service,
-                 "Quantity": m.group(3),
-                 "Amount": clean_amount(next_amount)}
-            )
+            records.append({**header_data,
+                "Service Date": m.group(1),
+                "Reference": ref,
+                "Service Provided": service,
+                "Quantity": m.group(3),
+                "Amount": clean_amount(next_amount)})
             continue
+
     return records
 
-# ---------------------------
-# Parse invoice page
-# ---------------------------
+
 def parse_invoice(text, prev_header=None):
     header_patterns = {
         "Tax Invoice": r"Tax Invoice\s+(\d+)",
@@ -163,10 +156,8 @@ def parse_invoice(text, prev_header=None):
         "Payment Due": r"Payment due by\s+([\d/]+)",
     }
 
-    header_data = {
-        f: (m.group(1).strip() if (m := re.search(p, text, re.I)) else "")
-        for f, p in header_patterns.items()
-    }
+    header_data = {f: (m.group(1).strip() if (m := re.search(p, text, re.I)) else "")
+                   for f, p in header_patterns.items()}
 
     if prev_header:
         for key, val in header_data.items():
@@ -174,6 +165,7 @@ def parse_invoice(text, prev_header=None):
                 header_data[key] = prev_header.get(key, "")
 
     records = []
+
     for block in re.finditer(
         r"Date\s+(?:Reference\s+)?Service Provided(.+?)(?:Site\s+Total|continued overleaf|Total\s+Inc|GST\s+|\Z)",
         text,
@@ -195,16 +187,13 @@ def parse_invoice(text, prev_header=None):
 
     return records, header_data
 
-# ---------------------------
-# Validation
-# ---------------------------
+
 def validate_invoices(df):
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
-    validation_records = []
-    mismatched_lines = []
+    validation_records, mismatched_lines = [], []
 
     for inv, group in df.groupby("Tax Invoice"):
         sum_amount = group["Amount"].sum()
@@ -221,34 +210,32 @@ def validate_invoices(df):
         if reported_total and abs(calc_total_inc - reported_total) >= 1.00:
             status = "MISMATCH"
 
-        validation_records.append(
-            {"Tax Invoice": inv,
-             "Extracted Sum": round(sum_amount, 2),
-             "Expected GST (10%)": expected_gst,
-             "Calculated Total Inc GST": calc_total_inc,
-             "Reported Total Inc GST": reported_total,
-             "Status": status}
-        )
+        validation_records.append({
+            "Tax Invoice": inv,
+            "Extracted Sum": round(sum_amount, 2),
+            "Expected GST (10%)": expected_gst,
+            "Calculated Total Inc GST": calc_total_inc,
+            "Reported Total Inc GST": reported_total,
+            "Status": status,
+        })
 
         if status == "MISMATCH":
             mismatched_lines.extend(group.to_dict(orient="records"))
 
     return pd.DataFrame(validation_records), pd.DataFrame(mismatched_lines)
 
-# ---------------------------
-# Streamlit App
-# ---------------------------
-st.set_page_config(page_title="Invoice Extractor", layout="wide")
 
-st.title("📄 Invoice Extractor & Validator")
-st.write("Upload a **PDF invoice** to extract line items, validate totals, and download results as Excel.")
+# ---------------------------
+# STREAMLIT APP
+# ---------------------------
+st.set_page_config(page_title="Invoice Parser", layout="wide")
+st.title("📄 Invoice Parser NEW VEOLIA(Suez)")
 
-uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+uploaded_file = st.file_uploader("Upload a PDF Invoice", type=["pdf"])
 
 if uploaded_file:
     texts = extract_text_from_pdf(uploaded_file)
-    all_records = []
-    prev_header = None
+    all_records, prev_header = [], None
 
     for page_text in texts:
         records, prev_header = parse_invoice(page_text, prev_header)
@@ -257,23 +244,28 @@ if uploaded_file:
     df = pd.DataFrame(all_records)
     validation_df, mismatched_df = validate_invoices(df)
 
-    st.subheader("📊 Extracted Line Items")
-    st.dataframe(df, use_container_width=True)
+    st.subheader("Line Items")
+    st.dataframe(df)
 
-    st.subheader("✅ Validation Results")
-    st.dataframe(validation_df, use_container_width=True)
+    st.subheader("Validation Summary")
+    st.dataframe(validation_df)
 
     if not mismatched_df.empty:
-        st.subheader("⚠️ Mismatched Lines")
-        st.dataframe(mismatched_df, use_container_width=True)
+        st.subheader("Mismatched Lines")
+        st.dataframe(mismatched_df)
 
-    # Excel Export
+    # Export to Excel for download
     output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         if not df.empty:
             df.to_excel(writer, sheet_name="Line_Items", index=False)
         if not validation_df.empty:
             validation_df.to_excel(writer, sheet_name="Validation", index=False)
         if not mismatched_df.empty:
             mismatched_df.to_excel(writer, sheet_name="Mismatched_Lines", index=False)
-    st.download_button("📥 Download Excel", data=output.getvalue(), file_name="invoices_output.xlsx")
+    st.download_button(
+        label="📥 Download Excel Report",
+        data=output.getvalue(),
+        file_name="invoices_output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
