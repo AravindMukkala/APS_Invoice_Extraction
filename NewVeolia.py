@@ -9,18 +9,23 @@ from io import BytesIO
 # ---------------------------
 def extract_text_from_pdf(pdf_input):
     """
-    Accepts either:
-      - a filesystem path (str / os.PathLike)
-      - a file-like object (BytesIO / streamlit UploadedFile)
-      - raw bytes
-    Returns list of page texts.
+    Accepts:
+      - str (file path)
+      - BytesIO / raw bytes
+      - Streamlit UploadedFile
     """
-    if isinstance(pdf_input, (str, bytes, BytesIO)):
+    if isinstance(pdf_input, str):
+        # Local path
         doc = fitz.open(pdf_input)
     else:
-        # assume UploadedFile from streamlit
-        doc = fitz.open(stream=pdf_input.read(), filetype="pdf")
+        # UploadedFile, BytesIO, or bytes → open as stream
+        if hasattr(pdf_input, "read"):  # Streamlit UploadedFile / BytesIO
+            pdf_bytes = pdf_input.read()
+        else:  # already bytes
+            pdf_bytes = pdf_input
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     return [page.get_text("text") for page in doc]
+
 
 # ---------------------------
 # Extract Customer & Address
