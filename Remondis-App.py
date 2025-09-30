@@ -136,25 +136,35 @@ def extract_invoice_data(pdf_file):
                 )
 
                 # --- Rental / Period Charges ---
+                                # --- Rental / Period Charges ---
                 if line.startswith("Site:"):
-                    description_lines = [line.strip()]
+                    raw_text = line.strip()
+                
+                    # Cut off footer parts if they got merged into the same line
+                    raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", raw_text)[0].strip()
+                
+                    description_lines = [raw_text]
                     qty, price, total = "", "", ""
                 
-                    # Look ahead for next lines to capture numeric info
+                    # Look ahead for numeric details on the next line(s)
                     j = i + 1
                     while j < len(lines):
                         next_line = lines[j].strip()
-                        
-                        # Match numeric pattern: e.g., "1 x 4 $50.0000 $200.0000 Weekly"
+                
+                        # Stop if footer lines start here too
+                        if re.match(r"(Totals|Total:|Page:|Tax Invoice:)", next_line):
+                            break
+                
+                        # Match rental numbers: e.g. "1 x 4 $50.0000 $200.0000 Weekly"
                         match_rental = re.match(r"(\d+)\s*x\s*(\d+)\s*\$([\d.,]+)\s*\$([\d.,]+)\s*(.*)", next_line)
                         if match_rental:
                             units, qty, price, total, extra = match_rental.groups()
                             if extra.strip():
                                 description_lines.append(extra.strip())
-                            skip_next = True  # skip numeric line in next iteration
+                            skip_next = True
                             break
                         else:
-                            description_lines.append(next_line)  # keep text lines in description
+                            description_lines.append(next_line)
                         j += 1
                 
                     description = " ".join(description_lines)
@@ -189,6 +199,7 @@ def extract_invoice_data(pdf_file):
                     }
                     all_bookings.append(booking_item)
                     continue
+
 
 
                 # --- Normal booking / disposal ---
