@@ -129,12 +129,10 @@ def extract_invoice_data(pdf_file):
 
                 # --- Rental / Period Charges ---
                 if line.startswith("Site:"):
-                    raw_text = line.strip()
-                    raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", raw_text)[0].strip()
+                    raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", line)[0].strip()
 
                     qty, price, total_val = "", "", ""
 
-                    # Try inline match first
                     match_inline = re.search(r"(\d+)\s*\$([\d.,]+)\s*\$([\d.,]+)", raw_text)
                     if match_inline:
                         qty, price, total_val = match_inline.groups()
@@ -171,28 +169,20 @@ def extract_invoice_data(pdf_file):
                     }
                     all_lines.append(line_item)
 
-                    booking_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
+                    booking_item = line_item.copy()
+                    booking_item.update({
                         "Account Number": header.get("Account Number", ""),
                         "Service Site": header.get("Service Site", ""),
                         "Invoice Date": header.get("Invoice Date", ""),
-                        "Date": "",
-                        "Ref No": "",
-                        "Description": description.strip(),
-                        "PO": "",
-                        "Qty": qty,
-                        "Price": price,
-                        "Total": total_val,
-                        "Charge Type": "Rental",
-                    }
+                    })
                     all_bookings.append(booking_item)
                     continue
 
-                # --- Booking / Disposal Lines ---
+                # --- Booking / Disposal / Surcharge ---
                 clean_line = re.split(r"\b(Totals|Total:|Page:|Tax Invoice:)", line)[0].strip()
 
-                match_booking = re.match(
-                    r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)",
+                match_booking_or_surcharge = re.match(
+                    r"^(\d{2}/\d{2}/\d{2})\s+(\S+)\s+(.+?)\s+(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)",
                     clean_line
                 )
                 match_disposal = re.match(
@@ -200,13 +190,19 @@ def extract_invoice_data(pdf_file):
                     clean_line
                 )
 
-                if match_booking:
-                    date_, ref_no, description, po, price, total_val = match_booking.groups()
-                    qty = "1"
-                    charge_type = "Booking"
+                if match_booking_or_surcharge:
+                    date_, ref_or_desc, description, qty, price, total_val = match_booking_or_surcharge.groups()
+
+                    if re.match(r"^\d+$", ref_or_desc):  # Booking (numeric Ref No)
+                        ref_no = ref_or_desc
+                        charge_type = "Booking"
+                    else:  # Surcharge (non-numeric, e.g. "Energy")
+                        ref_no = ""
+                        description = ref_or_desc + " " + description
+                        charge_type = "Surcharge"
+
                 elif match_disposal:
                     date_, ref_no, description, qty1, qty2, price, total_val = match_disposal.groups()
-                    po = ""
                     qty = qty2
                     charge_type = "Disposal"
                 else:
@@ -217,7 +213,7 @@ def extract_invoice_data(pdf_file):
                     "Date": date_,
                     "Ref No": ref_no,
                     "Description": description.strip(),
-                    "PO": po,
+                    "PO": "",
                     "Qty": qty,
                     "Price": price,
                     "Total": total_val,
@@ -225,20 +221,12 @@ def extract_invoice_data(pdf_file):
                 }
                 all_lines.append(line_item)
 
-                booking_item = {
-                    "Invoice Number": header.get("Tax Invoice", ""),
+                booking_item = line_item.copy()
+                booking_item.update({
                     "Account Number": header.get("Account Number", ""),
                     "Service Site": header.get("Service Site", ""),
                     "Invoice Date": header.get("Invoice Date", ""),
-                    "Date": date_,
-                    "Ref No": ref_no,
-                    "Description": description.strip(),
-                    "PO": po,
-                    "Qty": qty,
-                    "Price": price,
-                    "Total": total_val,
-                    "Charge Type": charge_type,
-                }
+                })
                 all_bookings.append(booking_item)
 
     # --- Create DataFrames ---
@@ -307,7 +295,7 @@ def extract_invoice_data(pdf_file):
 # --- STREAMLIT APP ---
 st.set_page_config(page_title="Remondis Invoice Extractor", layout="wide")
 st.title("📑 Remondis Invoice Extractor")
-st.write("Upload a PDF Tax Invoice to extract structured data, including Bookings, Disposal & Rentals.")
+st.write("Upload a PDF Tax Invoice to extract structured data, including Bookings, Disposal, Rentals & Surcharges.")
 
 uploaded_file = st.file_uploader("Upload PDF", type="pdf")
 
