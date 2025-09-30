@@ -136,69 +136,75 @@ def extract_invoice_data(pdf_file):
                 )
 
                 # --- Rental / Period Charges ---
-                                # --- Rental / Period Charges ---
-                if line.startswith("Site:"):
-                    raw_text = line.strip()
-                
-                    # Cut off footer parts if they got merged into the same line
-                    raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", raw_text)[0].strip()
-                
-                    description_lines = [raw_text]
-                    qty, price, total = "", "", ""
-                
-                    # Look ahead for numeric details on the next line(s)
+                # --- Rental / Period Charges ---
+            if line.startswith("Site:"):
+                raw_text = line.strip()
+            
+                # Cut off footer if it got merged into same line
+                raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", raw_text)[0].strip()
+            
+                qty, price, total = "", "", ""
+            
+                # First, try to extract numbers directly from this line
+                match_inline = re.search(r"(\d+)\s*\$([\d.,]+)\s*\$([\d.,]+)", raw_text)
+                if match_inline:
+                    qty, price, total = match_inline.groups()
+                    # Remove the numeric portion from description
+                    description = raw_text[:match_inline.start()].strip()
+                else:
+                    description = raw_text
+            
+                    # If not inline, look ahead for numbers on next lines
                     j = i + 1
                     while j < len(lines):
                         next_line = lines[j].strip()
-                
-                        # Stop if footer lines start here too
+            
                         if re.match(r"(Totals|Total:|Page:|Tax Invoice:)", next_line):
                             break
-                
-                        # Match rental numbers: e.g. "1 x 4 $50.0000 $200.0000 Weekly"
-                        match_rental = re.match(r"(\d+)\s*x\s*(\d+)\s*\$([\d.,]+)\s*\$([\d.,]+)\s*(.*)", next_line)
+            
+                        match_rental = re.match(r"(\d+)\s*x?\s*(\d*)\s*\$([\d.,]+)\s*\$([\d.,]+)\s*(.*)", next_line)
                         if match_rental:
-                            units, qty, price, total, extra = match_rental.groups()
+                            units, qty2, price, total, extra = match_rental.groups()
+                            qty = qty2 if qty2 else units
                             if extra.strip():
-                                description_lines.append(extra.strip())
+                                description += " " + extra.strip()
                             skip_next = True
                             break
                         else:
-                            description_lines.append(next_line)
+                            description += " " + next_line
                         j += 1
-                
-                    description = " ".join(description_lines)
-                
-                    # --- Create line items ---
-                    line_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
-                        "Date": "",
-                        "Ref No": "",
-                        "Description": description.strip(),
-                        "PO": "",
-                        "Qty": qty,
-                        "Price": price,
-                        "Total": total,
-                        "Charge Type": "Rental",
-                    }
-                    all_lines.append(line_item)
-                
-                    booking_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
-                        "Account Number": header.get("Account Number", ""),
-                        "Service Site": header.get("Service Site", ""),
-                        "Invoice Date": header.get("Invoice Date", ""),
-                        "Date": "",
-                        "Ref No": "",
-                        "Description": description.strip(),
-                        "PO": "",
-                        "Qty": qty,
-                        "Price": price,
-                        "Total": total,
-                        "Charge Type": "Rental",
-                    }
-                    all_bookings.append(booking_item)
-                    continue
+            
+                # --- Create line items ---
+                line_item = {
+                    "Invoice Number": header.get("Tax Invoice", ""),
+                    "Date": "",
+                    "Ref No": "",
+                    "Description": description.strip(),
+                    "PO": "",
+                    "Qty": qty,
+                    "Price": price,
+                    "Total": total,
+                    "Charge Type": "Rental",
+                }
+                all_lines.append(line_item)
+            
+                booking_item = {
+                    "Invoice Number": header.get("Tax Invoice", ""),
+                    "Account Number": header.get("Account Number", ""),
+                    "Service Site": header.get("Service Site", ""),
+                    "Invoice Date": header.get("Invoice Date", ""),
+                    "Date": "",
+                    "Ref No": "",
+                    "Description": description.strip(),
+                    "PO": "",
+                    "Qty": qty,
+                    "Price": price,
+                    "Total": total,
+                    "Charge Type": "Rental",
+                }
+                all_bookings.append(booking_item)
+                continue
+
 
 
 
