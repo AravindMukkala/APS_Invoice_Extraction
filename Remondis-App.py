@@ -38,7 +38,7 @@ def extract_invoice_data(pdf_file):
         lines = text.splitlines()
         header = {}
 
-        # --- Extract footer header info ---
+        # --- Extract invoice header info ---
         footer_line = next((l for l in lines if re.search(r"Tax Invoice:.*Invoice Date:.*Acc:", l)), None)
         if footer_line:
             invoice_match = re.search(r"Tax Invoice:\s*(\d+)", footer_line)
@@ -55,7 +55,6 @@ def extract_invoice_data(pdf_file):
             if name_match:
                 header["Customer Name"] = name_match.group(1).strip()
 
-        # --- Extract customer name ---
         try:
             cust_idx = next(
                 i for i, l in enumerate(lines)
@@ -67,7 +66,6 @@ def extract_invoice_data(pdf_file):
         except StopIteration:
             header.setdefault("Customer Name", "")
 
-        # --- Additional header fallback extraction ---
         if "Tax Invoice" not in header or not header["Tax Invoice"]:
             match = re.search(r"Tax Invoice\s+(\d+)", text)
             if match:
@@ -99,51 +97,71 @@ def extract_invoice_data(pdf_file):
                     if not all_headers_dict[invoice_no].get(key) and val:
                         all_headers_dict[invoice_no][key] = val
 
-        # --- Process each page in chunk ---
+        # --- Parse line items ---
+        skip_next = False
         for idx_page, page in enumerate(chunk):
             text = page.extract_text()
             lines = text.splitlines()
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                
-                # Skip empty lines
-                if not line:
-                    i += 1
+
+            if idx_page != 0:
+                footer_line = next((l for l in lines if re.search(r"Tax Invoice:.*Invoice Date:.*Acc:", l)), None)
+                if footer_line:
+                    invoice_match = re.search(r"Tax Invoice:\s*(\d+)", footer_line)
+                    date_match = re.search(r"Invoice Date:\s*([0-9/]+)", footer_line)
+                    acc_match = re.search(r"Acc:\s*([\d.]+)", footer_line)
+                    name_match = re.search(r"Acc:\s*[\d.]+\s+(.*)", footer_line)
+
+                    if invoice_match:
+                        header["Tax Invoice"] = invoice_match.group(1)
+                    if date_match:
+                        header["Invoice Date"] = date_match.group(1)
+                    if acc_match:
+                        header["Account Number"] = acc_match.group(1).split('.')[0]
+                    if name_match:
+                        header["Customer Name"] = name_match.group(1).strip()
+
+            for i, line in enumerate(lines):
+                if skip_next:
+                    skip_next = False
                     continue
 
-                # --- Pattern 1: Booking / disposal lines ---
+                line = line.strip()
+
+                # --- Booking / disposal lines ---
                 match_booking = re.match(
-                    r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)",
-                    line
+                    r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)", line
+                )
+                match_disposal = re.match(
+                    r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+([\d.,]+)\s+\w+\s+([\d.,]+)\s+\$([\d.,]+)\s+\$([\d.,]+)", line
                 )
 
-                # --- Pattern 2: Rental / Period Charges ---
-                match_rental = None
+                # --- Rental / Period Charges ---
                 if line.startswith("Site:"):
-                    description_lines = [line]
-                    j = i + 1
-                    while j < len(lines) and not re.match(r"^\d+\s+\$[\d.,]+\s+\$[\d.,]+", lines[j].strip()):
-                        description_lines.append(lines[j].strip())
-                        j += 1
-                    qty, price, total_ = "", "", ""
-                    if j < len(lines):
-                        m = re.match(r"^(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)", lines[j].strip())
-                        if m:
-                            qty, price, total_ = m.groups()
-                    description = " ".join(description_lines)
+                    description = line
+                    if i + 1 < len(lines) and not lines[i + 1].startswith(("Site:", "Invoice")):
+                        description += " " + lines[i + 1].strip()
+                        skip_next = True
+
+                    qty, price, total = "", "", ""
+                    if i + 2 < len(lines):
+                        match_rental = re.match(r"^(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)", lines[i + 2].strip())
+                        if match_rental:
+                            qty, price, total = match_rental.groups()
+                            skip_next = True
 
                     line_item = {
                         "Invoice Number": header.get("Tax Invoice", ""),
                         "Date": "",
                         "Ref No": "",
-                        "Description": description,
+                        "Description": description.strip(),
                         "PO": "",
                         "Qty": qty,
                         "Price": price,
-                        "Total": total_,
+                        "Total": total,
                         "Charge Type": "Rental",
                     }
+                    all_lines.append(line_item)
+
                     booking_item = {
                         "Invoice Number": header.get("Tax Invoice", ""),
                         "Account Number": header.get("Account Number", ""),
@@ -151,52 +169,57 @@ def extract_invoice_data(pdf_file):
                         "Invoice Date": header.get("Invoice Date", ""),
                         "Date": "",
                         "Ref No": "",
-                        "Description": description,
+                        "Description": description.strip(),
                         "PO": "",
                         "Qty": qty,
                         "Price": price,
-                        "Total": total_,
+                        "Total": total,
                         "Charge Type": "Rental",
                     }
-                    all_lines.append(line_item)
                     all_bookings.append(booking_item)
-                    i = j + 1
                     continue
 
-                # --- Process booking/disposal ---
+                # --- Normal booking / disposal ---
                 if match_booking:
                     date_, ref_no, description, po, price, total_ = match_booking.groups()
-                    line_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
-                        "Date": date_,
-                        "Ref No": ref_no,
-                        "Description": description.strip(),
-                        "PO": po,
-                        "Qty": "1",
-                        "Price": price,
-                        "Total": total_,
-                        "Charge Type": "Booking",
-                    }
-                    booking_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
-                        "Account Number": header.get("Account Number", ""),
-                        "Service Site": header.get("Service Site", ""),
-                        "Invoice Date": header.get("Invoice Date", ""),
-                        "Date": date_,
-                        "Ref No": ref_no,
-                        "Description": description.strip(),
-                        "PO": po,
-                        "Qty": "1",
-                        "Price": price,
-                        "Total": total_,
-                        "Charge Type": "Booking",
-                    }
-                    all_lines.append(line_item)
-                    all_bookings.append(booking_item)
-                    i += 1
+                    qty = "1"
+                    charge_type = "Booking"
+                elif match_disposal:
+                    date_, ref_no, description, qty1, qty2, price, total_ = match_disposal.groups()
+                    po = ""
+                    qty = qty2
+                    charge_type = "Disposal"
+                else:
                     continue
 
-                i += 1
+                line_item = {
+                    "Invoice Number": header.get("Tax Invoice", ""),
+                    "Date": date_,
+                    "Ref No": ref_no,
+                    "Description": description.strip(),
+                    "PO": po,
+                    "Qty": qty,
+                    "Price": price,
+                    "Total": total_,
+                    "Charge Type": charge_type,
+                }
+                all_lines.append(line_item)
+
+                booking_item = {
+                    "Invoice Number": header.get("Tax Invoice", ""),
+                    "Account Number": header.get("Account Number", ""),
+                    "Service Site": header.get("Service Site", ""),
+                    "Invoice Date": header.get("Invoice Date", ""),
+                    "Date": date_,
+                    "Ref No": ref_no,
+                    "Description": description.strip(),
+                    "PO": po,
+                    "Qty": qty,
+                    "Price": price,
+                    "Total": total_,
+                    "Charge Type": charge_type,
+                }
+                all_bookings.append(booking_item)
 
     # --- Create DataFrames ---
     headers_df = pd.DataFrame(list(all_headers_dict.values()))
@@ -264,20 +287,25 @@ def extract_invoice_data(pdf_file):
 # --- STREAMLIT APP ---
 st.set_page_config(page_title="Remondis Invoice Extractor", layout="wide")
 st.title("📑 Remondis Invoice Extractor")
-st.write("Upload a PDF Tax Invoice to extract structured data and validate totals.")
+st.write("Upload a PDF Tax Invoice to extract structured data, including Bookings, Disposal & Rentals.")
 
 uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+
 if uploaded_file is not None:
     with st.spinner("Processing PDF..."):
         headers_df, lines_df, bookings_df, validation_df, output, output_file = extract_invoice_data(uploaded_file)
 
     st.success("✅ Extraction & validation complete!")
+
     st.subheader("Invoice Headers")
     st.dataframe(headers_df)
+
     st.subheader("Line Items")
     st.dataframe(lines_df)
+
     st.subheader("Bookings")
     st.dataframe(bookings_df)
+
     st.subheader("Validation Results")
     st.dataframe(validation_df)
 
