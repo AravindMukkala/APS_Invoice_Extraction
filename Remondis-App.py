@@ -137,18 +137,29 @@ def extract_invoice_data(pdf_file):
 
                 # --- Rental / Period Charges ---
                 if line.startswith("Site:"):
-                    description = line
-                    if i + 1 < len(lines) and not lines[i + 1].startswith(("Site:", "Invoice")):
-                        description += " " + lines[i + 1].strip()
-                        skip_next = True
-
+                    description_lines = [line.strip()]
                     qty, price, total = "", "", ""
-                    if i + 2 < len(lines):
-                        match_rental = re.match(r"^(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)", lines[i + 2].strip())
+                
+                    # Look ahead for next lines to capture numeric info
+                    j = i + 1
+                    while j < len(lines):
+                        next_line = lines[j].strip()
+                        
+                        # Match numeric pattern: e.g., "1 x 4 $50.0000 $200.0000 Weekly"
+                        match_rental = re.match(r"(\d+)\s*x\s*(\d+)\s*\$([\d.,]+)\s*\$([\d.,]+)\s*(.*)", next_line)
                         if match_rental:
-                            qty, price, total = match_rental.groups()
-                            skip_next = True
-
+                            units, qty, price, total, extra = match_rental.groups()
+                            if extra.strip():
+                                description_lines.append(extra.strip())
+                            skip_next = True  # skip numeric line in next iteration
+                            break
+                        else:
+                            description_lines.append(next_line)  # keep text lines in description
+                        j += 1
+                
+                    description = " ".join(description_lines)
+                
+                    # --- Create line items ---
                     line_item = {
                         "Invoice Number": header.get("Tax Invoice", ""),
                         "Date": "",
@@ -161,7 +172,7 @@ def extract_invoice_data(pdf_file):
                         "Charge Type": "Rental",
                     }
                     all_lines.append(line_item)
-
+                
                     booking_item = {
                         "Invoice Number": header.get("Tax Invoice", ""),
                         "Account Number": header.get("Account Number", ""),
@@ -178,6 +189,7 @@ def extract_invoice_data(pdf_file):
                     }
                     all_bookings.append(booking_item)
                     continue
+
 
                 # --- Normal booking / disposal ---
                 if match_booking:
