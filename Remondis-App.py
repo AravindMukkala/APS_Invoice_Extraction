@@ -119,36 +119,55 @@ def extract_invoice_data(pdf_file):
 
             for line in lines:
                 line = line.strip()
-                match = re.match(r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)", line)
-                if match:
-                    date_, ref_no, description, po, price, total_ = match.groups()
 
-                    line_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
-                        "Date": date_,
-                        "Ref No": ref_no,
-                        "Description": description.strip(),
-                        "PO": po,
-                        "Qty": "1",
-                        "Price": price,
-                        "Total": total_,
-                    }
-                    all_lines.append(line_item)
+                # --- Pattern 1: old style ---
+                match1 = re.match(
+                    r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+(\d+)\s+\$([\d.,]+)\s+\$([\d.,]+)", line
+                )
 
-                    booking_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
-                        "Account Number": header.get("Account Number", ""),
-                        "Service Site": header.get("Service Site", ""),
-                        "Invoice Date": header.get("Invoice Date", ""),
-                        "Date": date_,
-                        "Ref No": ref_no,
-                        "Description": description.strip(),
-                        "PO": po,
-                        "Qty": "1",
-                        "Price": price,
-                        "Total": total_,
-                    }
-                    all_bookings.append(booking_item)
+                # --- Pattern 2: disposal/weight style ---
+                match2 = re.match(
+                    r"^(\d{2}/\d{2}/\d{2})\s+([\d.]+)\s+(.+?)\s+([\d.,]+)\s+\w+\s+([\d.,]+)\s+\$([\d.,]+)\s+\$([\d.,]+)", line
+                )
+
+                if match1:
+                    date_, ref_no, description, po, price, total_ = match1.groups()
+                    qty = "1"
+
+                elif match2:
+                    date_, ref_no, description, qty1, qty2, price, total_ = match2.groups()
+                    po = ""
+                    qty = qty2  # use second numeric as Qty
+
+                else:
+                    continue
+
+                line_item = {
+                    "Invoice Number": header.get("Tax Invoice", ""),
+                    "Date": date_,
+                    "Ref No": ref_no,
+                    "Description": description.strip(),
+                    "PO": po,
+                    "Qty": qty,
+                    "Price": price,
+                    "Total": total_,
+                }
+                all_lines.append(line_item)
+
+                booking_item = {
+                    "Invoice Number": header.get("Tax Invoice", ""),
+                    "Account Number": header.get("Account Number", ""),
+                    "Service Site": header.get("Service Site", ""),
+                    "Invoice Date": header.get("Invoice Date", ""),
+                    "Date": date_,
+                    "Ref No": ref_no,
+                    "Description": description.strip(),
+                    "PO": po,
+                    "Qty": qty,
+                    "Price": price,
+                    "Total": total_,
+                }
+                all_bookings.append(booking_item)
 
     # --- Create DataFrames ---
     headers_df = pd.DataFrame(list(all_headers_dict.values()))
@@ -185,7 +204,6 @@ def extract_invoice_data(pdf_file):
 
             invoice_bookings = bookings_df[bookings_df["Invoice Number"] == invoice_no]
             sum_total = invoice_bookings["Total"].sum() if not invoice_bookings.empty else 0
-
             sum_with_gst = sum_total * (1 + GST_RATE)
 
             is_valid = pd.isna(expected_total) or abs(sum_with_gst - expected_total) < 0.01
