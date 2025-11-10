@@ -3,10 +3,12 @@ import pdfplumber
 import pandas as pd
 import re
 import io
+import gc
+import time
 
 def extract_invoice_data(pdf_file):
-    status = st.empty()  # Streamlit status updater
-    status.text("Starting extraction...")
+    status = st.empty()  # Streamlit status text
+    progress = st.progress(0, text="Starting extraction...")
 
     all_headers_dict = {}
     all_lines = []
@@ -14,27 +16,29 @@ def extract_invoice_data(pdf_file):
 
     with pdfplumber.open(pdf_file) as pdf:
         total_pages = len(pdf.pages)
-        status.text(f"PDF opened, total pages: {total_pages}")
+        progress.progress(0, text=f"PDF opened — {total_pages} pages detected")
         invoice_chunks = []
         current_chunk = []
 
+        # --- Identify invoice chunks ---
         for i, page in enumerate(pdf.pages, 1):
-            text = page.extract_text()
+            text = page.extract_text() or ""
             if "Tax Invoice" in text and current_chunk:
                 invoice_chunks.append(current_chunk)
                 current_chunk = []
             current_chunk.append(page)
-            status.text(f"Reading page {i} of {total_pages}...")
-
+            progress.progress(int(i / total_pages * 30), text=f"Reading page {i}/{total_pages}...")
         if current_chunk:
             invoice_chunks.append(current_chunk)
 
-    status.text(f"Found {len(invoice_chunks)} invoice chunks, processing...")
+    progress.progress(35, text=f"Found {len(invoice_chunks)} invoice chunks, processing...")
 
     for idx, chunk in enumerate(invoice_chunks, 1):
-        status.text(f"Processing invoice chunk {idx} of {len(invoice_chunks)}...")
+        progress.progress(int(35 + (idx / len(invoice_chunks)) * 50),
+                          text=f"Processing invoice {idx}/{len(invoice_chunks)}...")
+
         first_page = chunk[0]
-        text = first_page.extract_text()
+        text = first_page.extract_text() or ""
         lines = text.splitlines()
         header = {}
 
@@ -100,7 +104,7 @@ def extract_invoice_data(pdf_file):
         # --- Parse line items ---
         skip_next = False
         for idx_page, page in enumerate(chunk):
-            text = page.extract_text()
+            text = page.extract_text() or ""
             lines = text.splitlines()
 
             if idx_page != 0:
@@ -129,12 +133,9 @@ def extract_invoice_data(pdf_file):
 
                 # --- Rental / Period Charges ---
                 if line.startswith("Site:"):
-                    raw_text = line.strip()
-                    raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", raw_text)[0].strip()
-
+                    raw_text = re.split(r"\b(Total:|Totals|Page:|Tax Invoice:)", line)[0].strip()
                     qty, price, total_val = "", "", ""
 
-                    # Try inline match first
                     match_inline = re.search(r"(\d+)\s*\$([\d.,]+)\s*\$([\d.,]+)", raw_text)
                     if match_inline:
                         qty, price, total_val = match_inline.groups()
@@ -171,20 +172,12 @@ def extract_invoice_data(pdf_file):
                     }
                     all_lines.append(line_item)
 
-                    booking_item = {
-                        "Invoice Number": header.get("Tax Invoice", ""),
+                    booking_item = line_item.copy()
+                    booking_item.update({
                         "Account Number": header.get("Account Number", ""),
                         "Service Site": header.get("Service Site", ""),
                         "Invoice Date": header.get("Invoice Date", ""),
-                        "Date": "",
-                        "Ref No": "",
-                        "Description": description.strip(),
-                        "PO": "",
-                        "Qty": qty,
-                        "Price": price,
-                        "Total": total_val,
-                        "Charge Type": "Rental",
-                    }
+                    })
                     all_bookings.append(booking_item)
                     continue
 
@@ -225,21 +218,18 @@ def extract_invoice_data(pdf_file):
                 }
                 all_lines.append(line_item)
 
-                booking_item = {
-                    "Invoice Number": header.get("Tax Invoice", ""),
+                booking_item = line_item.copy()
+                booking_item.update({
                     "Account Number": header.get("Account Number", ""),
                     "Service Site": header.get("Service Site", ""),
                     "Invoice Date": header.get("Invoice Date", ""),
-                    "Date": date_,
-                    "Ref No": ref_no,
-                    "Description": description.strip(),
-                    "PO": po,
-                    "Qty": qty,
-                    "Price": price,
-                    "Total": total_val,
-                    "Charge Type": charge_type,
-                }
+                })
                 all_bookings.append(booking_item)
+
+        gc.collect()
+        time.sleep(0.1)
+
+    progress.progress(90, text="Building dataframes...")
 
     # --- Create DataFrames ---
     headers_df = pd.DataFrame(list(all_headers_dict.values()))
@@ -288,11 +278,8 @@ def extract_invoice_data(pdf_file):
 
     # --- Output Excel ---
     billing_periods = {h.get("Billing Period", "") for h in all_headers_dict.values() if h.get("Billing Period")}
-    if billing_periods:
-        safe_periods = "_".join(bp.replace(" ", "").replace("/", "-") for bp in billing_periods)
-        output_file = f"Remondis_Invoice_Data_{safe_periods}.xlsx"
-    else:
-        output_file = "Remondis_Invoice_Data.xlsx"
+    safe_periods = "_".join(bp.replace(" ", "").replace("/", "-") for bp in billing_periods) if billing_periods else ""
+    output_file = f"Remondis_Invoice_Data_{safe_periods or 'output'}.xlsx"
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -300,6 +287,8 @@ def extract_invoice_data(pdf_file):
         lines_df.to_excel(writer, sheet_name="Line Items", index=False)
         bookings_df.to_excel(writer, sheet_name="Bookings", index=False)
         validation_df.to_excel(writer, sheet_name="Validation", index=False)
+
+    progress.progress(100, text="✅ Extraction & validation complete!")
 
     return headers_df, lines_df, bookings_df, validation_df, output, output_file
 
