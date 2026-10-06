@@ -1,685 +1,698 @@
-import pdfplumber
-import pandas as pd
-import re
+"""
+Opal Recycling / Opal Packaging invoice PDF -> Excel extractor.
+
+How it works (and why it is robust):
+
+* Words are read with their x/y positions (pdfplumber.extract_words) and
+  grouped into visual rows.
+* The column header row ("Customer/ Description Period/ Reference Qty. ...")
+  is located on every page, and its x positions are used as column
+  boundaries.  Text that wraps onto a second line (e.g. "QR26-1590",
+  "BINS AUGUST 26", "30.09.2026 - LDPE", "(Wasteflex)") is therefore
+  appended to the correct column of the charge / customer it belongs to.
+* Amounts are parsed from the right-hand end of each row with strict
+  regexes, so descriptions and references may contain anything.
+* Every figure is cross-checked:
+    - each line:      Ex GST + GST = Incl. GST
+    - each charge:    Item Total + linked fuel levy = Ex GST
+    - each sub-total, customer total, invoice Total Payable and AMOUNT DUE
+
+Run as a web app:   streamlit run opal_invoice_extractor.py
+Run from the CLI:   python opal_invoice_extractor.py invoice.pdf [out.xlsx]
+"""
+
 import io
-import json
-import streamlit as st
+import re
+import sys
 
-# -----------------------------
-# Load learned patterns
-# -----------------------------
-def load_learned_patterns():
+import pandas as pd
+import pdfplumber
+
+
+# ============================================================
+# PATTERNS
+# ============================================================
+
+DATE = r"\d{2}\.\d{2}\.\d{4}"
+NUM = r"\d[\d,]*\.\d+"
+AMT = r"-?\d[\d,]*\.\d{2}"
+UNIT = r"[A-Za-z]{1,4}"
+
+DATE_RE = re.compile(rf"^{DATE}$")
+CUSTOMER_CODE_RE = re.compile(r"^R-[A-Z0-9]+$")
+
+INVOICE_NO_RE = re.compile(r"Invoice\s+No\.?\s*(\d+)", re.I)
+ACCOUNT_NO_RE = re.compile(r"Account\s+No\.?\s*(R-[A-Z0-9]+)", re.I)
+INVOICE_DATE_RE = re.compile(rf"^Date\s+({DATE})\s*$", re.I | re.M)
+AMOUNT_DUE_RE = re.compile(rf"AMOUNT\s+DUE\s+({AMT})\s*AUD", re.I)
+
+# Amount tails, matched against the END of a row.
+# FFS - Qty/Weight, Manual Price, period charges:
+#   1.635 TO 9.01 BL 45.05 47.50 4.75 52.25 AUD
+TAIL_UNIT_PRICE_RE = re.compile(
+    rf"(?P<qty>{NUM})\s+(?P<qty_unit>{UNIT})\s+"
+    rf"(?P<unit_price>{NUM})\s+(?P<price_unit>{UNIT})\s+"
+    rf"(?P<item>{AMT})\s+(?P<ex>{AMT})\s+(?P<gst>{AMT})\s+(?P<inc>{AMT})\s+AUD$"
+)
+# FFS - Load (no unit price):
+#   1.000 OT 240.00 253.30 25.33 278.63 AUD
+TAIL_LOAD_RE = re.compile(
+    rf"(?P<qty>{NUM})\s+(?P<qty_unit>{UNIT})\s+"
+    rf"(?P<item>{AMT})\s+(?P<ex>{AMT})\s+(?P<gst>{AMT})\s+(?P<inc>{AMT})\s+AUD$"
+)
+# Fuel levy:
+#   1.635 TO 0.49 BL 2.45     or     1.000 OT 13.30
+TAIL_FUEL_RE = re.compile(
+    rf"(?P<qty>{NUM})\s+(?P<qty_unit>{UNIT})\s+"
+    rf"(?:(?P<unit_price>{NUM})\s+(?P<price_unit>{UNIT})\s+)?"
+    rf"(?P<item>{AMT})$"
+)
+
+BILLED_QTY_RE = re.compile(rf"^Billed\s+Qty\s+({NUM})\s+({UNIT})$", re.I)
+
+SUBTOTAL_RE = re.compile(
+    rf"^SUB-TOTAL\s+(?P<code>\S+)\s+(?P<qty>{NUM})\s+(?P<qty_unit>{UNIT})\s+"
+    rf"(?P<ex>{AMT})\s+(?P<gst>{AMT})\s+(?P<inc>{AMT})\s+AUD$",
+    re.I,
+)
+# Note: the PDF sometimes renders "(TOTAL)" as "( TOTAL)".
+CUSTOMER_TOTAL_RE = re.compile(
+    rf"^(?P<code>R-[A-Z0-9]+)-\s*(?P<name>.*?)\s*\(\s*TOTAL\s*\)\s+"
+    rf"(?P<ex>{AMT})\s+(?P<gst>{AMT})\s+(?P<inc>{AMT})\s+AUD$",
+    re.I,
+)
+TOTAL_PAYABLE_RE = re.compile(
+    rf"^Total\s+Payable\s+(?P<ex>{AMT})\s+(?P<gst>{AMT})\s+(?P<inc>{AMT})\s+AUD$",
+    re.I,
+)
+PAGE_FOOTER_RE = re.compile(r"^Page\s+\d+\s+of\s+\d+$", re.I)
+
+FFS_QTY_RE = re.compile(r"FFS\s*-\s*Qty\s*/\s*Weight", re.I)
+FFS_LOAD_RE = re.compile(r"FFS\s*-\s*Load", re.I)
+MANUAL_RE = re.compile(r"Manual\s+Price", re.I)
+FUEL_RE = re.compile(r"^OPR\s+Fuel\s+Levy", re.I)
+PERIOD_RE = re.compile(rf"({DATE})\s+to\s*({DATE})?", re.I)
+
+TOLERANCE = 0.015
+
+INVOICE_COLUMNS = [
+    "Invoice No.", "Invoice Date", "Account No.",
+    "Customer Code", "Customer",
+    "Date", "Description", "Charge Type", "Period From", "Period To",
+    "Reference", "Sub-Total Code",
+    "Qty.", "Qty Value", "Qty Unit",
+    "Unit Price", "Unit Price Value", "Price Unit",
+    "Item Total", "Fuel Levy (linked)",
+    "Amount excl. GST", "GST", "Amount Incl. GST",
+    "Billed qty", "Billed Qty Value", "Billed Qty Unit",
+    "Is Fuel Levy", "Line Check", "Source Page",
+]
+
+
+# ============================================================
+# SMALL HELPERS
+# ============================================================
+
+def to_num(value):
+    if value is None or value == "":
+        return None
     try:
-        with open("learned_patterns.json", "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-def save_learned_patterns(patterns):
-    with open("learned_patterns.json", "w") as f:
-        json.dump(patterns, f, indent=2)
-
-learned_patterns = load_learned_patterns()
-
-# -----------------------------
-# Tokenizer
-# -----------------------------
-def tokenize_line(line):
-    tokens = line.split()
-    return " ".join([
-        "<DATE>" if re.match(r"\d{2}\.\d{2}\.\d{4}", t)
-        else "<NUMBER>" if re.match(r"^\d[\d,\.]*$", t)
-        else "<AUD>" if t.upper() == "AUD"
-        else "<TEXT>"
-        for t in tokens
-    ])
+        return float(str(value).replace(",", ""))
+    except ValueError:
+        return None
 
 
+def to_money(value):
+    n = to_num(value)
+    return None if n is None else round(n, 2)
 
-# -----------------------------
-# Main PDF Processing
-# -----------------------------
+
+def close(a, b):
+    if a is None or b is None or pd.isna(a) or pd.isna(b):
+        return False
+    return abs(float(a) - float(b)) <= TOLERANCE
+
+
+def join(*parts):
+    return " ".join(p for p in parts if p).strip()
+
+
+# ============================================================
+# PAGE LAYOUT
+# ============================================================
+
+def group_rows(words, y_tol=3.0):
+    """Group pdfplumber words into visual rows, left to right."""
+    rows = []
+    for w in sorted(words, key=lambda w: (round(w["top"], 1), w["x0"])):
+        if rows and abs(w["top"] - rows[-1]["top"]) <= y_tol:
+            rows[-1]["words"].append(w)
+        else:
+            rows.append({"top": w["top"], "words": [w]})
+    for r in rows:
+        r["words"].sort(key=lambda w: w["x0"])
+        r["text"] = " ".join(w["text"] for w in r["words"])
+    return rows
+
+
+def find_columns(rows):
+    """
+    Locate the table header row and return (header_index, boundaries).
+    Boundaries are the left edges of the Description, Period/Charge Type
+    and Reference columns.
+    """
+    for idx, row in enumerate(rows):
+        texts = [w["text"] for w in row["words"]]
+        if "Customer/" in texts and "Description" in texts and "Reference" in texts:
+            def x_of(label):
+                return next(w["x0"] for w in row["words"] if w["text"] == label)
+
+            period_label = "Period/" if "Period/" in texts else "Period"
+            bounds = {
+                "description": x_of("Description") - 2,
+                "charge_type": x_of(period_label) - 2,
+                "reference": x_of("Reference") - 2,
+            }
+            # The header is two visual lines ("Date", "Charge Type" ...).
+            # Skip the second one if present.
+            start = idx + 1
+            if start < len(rows) and rows[start]["text"].startswith("Date"):
+                start += 1
+            return start, bounds
+    return None, None
+
+
+def split_columns(words, bounds):
+    """Assign text words to the four text columns by x position."""
+    cols = {"first": [], "description": [], "charge_type": [], "reference": []}
+    for w in words:
+        x = w["x0"]
+        if x < bounds["description"]:
+            cols["first"].append(w["text"])
+        elif x < bounds["charge_type"]:
+            cols["description"].append(w["text"])
+        elif x < bounds["reference"]:
+            cols["charge_type"].append(w["text"])
+        else:
+            cols["reference"].append(w["text"])
+    return {k: " ".join(v) for k, v in cols.items()}
+
+
+def split_tail(row, pattern):
+    """
+    Match an amount pattern at the end of a row.
+    Returns (match, text_words_before_the_amounts) or (None, None).
+    """
+    m = pattern.search(row["text"])
+    if not m:
+        return None, None
+    n_tail = len(m.group(0).split())
+    words = row["words"]
+    if n_tail > len(words):
+        return None, None
+    tail_text = " ".join(w["text"] for w in words[-n_tail:])
+    if tail_text != m.group(0):
+        return None, None
+    # The amounts must start a new token (not the middle of a reference).
+    if m.start() > 0 and row["text"][m.start() - 1] != " ":
+        return None, None
+    return m, words[:-n_tail]
+
+
+# ============================================================
+# MAIN PARSER
+# ============================================================
+
+def parse_charge_type(text):
+    """Return (charge_type, period_from, period_to) for the charge-type column."""
+    if FFS_QTY_RE.search(text):
+        return "FFS - Qty/Weight", "", ""
+    if FFS_LOAD_RE.search(text):
+        return "FFS - Load", "", ""
+    if MANUAL_RE.search(text):
+        return "Manual Price", "", ""
+    m = PERIOD_RE.search(text)
+    if m:
+        return "Period Charge", m.group(1), m.group(2) or ""
+    return text.strip(), "", ""
+
+
 def process_pdf(file_stream):
-    invoice_no = ""
-    data = []
-    missed_lines = []
-    customer = ""
-    full_text = ""
+    rows_out = []          # charges + fuel levies
+    subtotals = []
+    customer_totals = []
+    invoice_totals = []
+    unmatched = []
+
+    inv = {"no": "", "date": "", "account": "", "amount_due": None}
+    cust = {"code": "", "name": ""}
+
+    open_charge = None     # charge row still collecting wrapped text
+    open_customer = False  # customer header still collecting wrapped name
+    last_main = None       # last main charge (for linking fuel levies)
+    pending = []           # charge rows awaiting their SUB-TOTAL code
 
     with pdfplumber.open(file_stream) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text()
-            full_text += (text or "") + "\n"
+            page_text = page.extract_text() or ""
 
-            # Extract invoice number
-            if not invoice_no and text and "Invoice No." in text:
-                match = re.search(r"Invoice No\. (\d+)", text)
-                if match:
-                    invoice_no = match.group(1)
+            # ---------------- invoice header ----------------
+            m = INVOICE_NO_RE.search(page_text)
+            if m and m.group(1) != inv["no"]:
+                # New invoice: reset all running state.
+                inv = {"no": m.group(1), "date": "", "account": "", "amount_due": None}
+                cust = {"code": "", "name": ""}
+                open_charge, open_customer, last_main, pending = None, False, None, []
+            m = INVOICE_DATE_RE.search(page_text)
+            if m:
+                inv["date"] = m.group(1)
+            m = ACCOUNT_NO_RE.search(page_text)
+            if m:
+                inv["account"] = m.group(1)
+            m = AMOUNT_DUE_RE.search(page_text)
+            if m:
+                inv["amount_due"] = to_money(m.group(1))
 
-            if not text:
-                continue
+            words = page.extract_words(keep_blank_chars=False, use_text_flow=False)
+            rows = group_rows(words)
+            start, bounds = find_columns(rows)
+            if start is None:
+                continue  # e.g. remittance-only page
 
-            lines = text.split("\n")
-
-            for i, line in enumerate(lines):
-                matched = False
-
-                # ---------------- Customer ----------------
-                cust_match = re.match(r"^(R-[A-Z0-9]+)\s+(.+)", line)
-                if cust_match:
-                    customer = cust_match.group(1) + " " + cust_match.group(2).strip()
-                    matched = True
+            for row in rows[start:]:
+                text = row["text"].strip()
+                if not text or PAGE_FOOTER_RE.match(text):
                     continue
 
-                # ---------------- Rental ----------------
-                rental_match = re.match(
-                    r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+(\d{2}\.\d{2}\.\d{4} to \d{2}\.\d{2}\.\d{4})\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+(\w+)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+) AUD",
-                    line
-                )
-                if rental_match:
-                    date, description, period, qty, qty_unit, unit_price, unit_unit, amt_excl_gst, gst, amt_incl_gst = rental_match.groups()
-                    billed_qty_line = lines[i + 1] if i + 1 < len(lines) else ""
-                    billed_qty_match = re.search(r"Billed Qty\s+([\d\.]+)\s+(\w+)", billed_qty_line)
-                    billed_qty_full = f"{billed_qty_match.group(1)} {billed_qty_match.group(2)}" if billed_qty_match else ""
-                    data.append({
-                        "Invoice No.": invoice_no, "Customer": customer, "Date": date, "Description": description,
-                        "Charge Type/Period Reference": period, "Reference": "", "Billed qty": billed_qty_full,
-                        "Qty.": f"{qty} {qty_unit}", "Unit Price": f"{unit_price} {unit_unit}",
-                        "Amount excl. GST": amt_excl_gst, "GST": gst, "Amount Incl. GST": amt_incl_gst
-                    })
-                    matched = True
-                    continue
-
-                # ---------------- FFS - Qty/Weight ----------------
-                ffs_match = re.match(
-                    r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+FFS - Qty/Weight\s+([\w\d/]+)\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+([\w\d\.]+)\s+([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+) AUD",
-                    line
-                )
-                if ffs_match:
-                    date, description, reference, qty, qty_unit, unit_price, unit_unit, amt_excl_gst, gst, amt_incl_gst = ffs_match.groups()
-                    billed_qty_line = lines[i + 1] if i + 1 < len(lines) else ""
-                    billed_qty_match = re.search(r"Billed Qty\s+([\d\.]+)\s+(\w+)", billed_qty_line)
-                    billed_qty_full = f"{billed_qty_match.group(1)} {billed_qty_match.group(2)}" if billed_qty_match else ""
-                    data.append({
-                        "Invoice No.": invoice_no, "Customer": customer, "Date": date, "Description": description,
-                        "Charge Type/Period Reference": "FFS - Qty/Weight", "Reference": reference,
-                        "Billed qty": billed_qty_full, "Qty.": f"{qty} {qty_unit}", "Unit Price": f"{unit_price} {unit_unit}",
-                        "Amount excl. GST": amt_excl_gst, "GST": gst, "Amount Incl. GST": amt_incl_gst
-                    })
-                    matched = True
-                    continue
-
-                # ---------------- FFS with TO ----------------
-                ffs_qty_to_match = re.match(
-                    r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+FFS - Qty/Weight\s+([\w\-\/]+)\s+([\d\.]+)\s+TO\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+) AUD",
-                    line
-                )
-                if ffs_qty_to_match:
-                    date, description, reference, val1, val2, qty_unit, billed_qty, unit_price, amt_incl_gst = ffs_qty_to_match.groups()
-                    gst = str(round(float(amt_incl_gst) - float(unit_price), 2))
-                    amt_excl_gst = unit_price
-                    billed_qty_full = f"{billed_qty} {qty_unit}"
-                    data.append({
-                        "Invoice No.": invoice_no, "Customer": customer, "Date": date,
-                        "Description": description, "Charge Type/Period Reference": "FFS - Qty/Weight",
-                        "Reference": reference, "Billed qty": billed_qty_full, "Qty.": f"{val1} TO {val2} {qty_unit}",
-                        "Unit Price": unit_price, "Amount excl. GST": amt_excl_gst,
-                        "GST": gst, "Amount Incl. GST": amt_incl_gst
-                    })
-                    matched = True
-                    continue
-
-                # ---------------- FFS - Load Compact ----------------
-                ffs_load_compact_match = re.match(
-                    r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+FFS - Load\s+([\w\-\.]+)\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+) AUD",
-                    line
-                )
-                if ffs_load_compact_match:
-                    date, description, reference, qty, qty_unit, unit_price, gst, amt_incl_gst = ffs_load_compact_match.groups()
-                    amt_excl_gst = str(round(float(amt_incl_gst) - float(gst), 2))
-                    billed_qty_line = lines[i + 1] if i + 1 < len(lines) else ""
-                    billed_qty_match = re.search(r"Billed Qty\s+([\d\.]+)\s+(\w+)", billed_qty_line)
-                    billed_qty_full = f"{billed_qty_match.group(1)} {billed_qty_match.group(2)}" if billed_qty_match else ""
-                    data.append({
-                        "Invoice No.": invoice_no, "Customer": customer, "Date": date,
-                        "Description": description.strip(), "Charge Type/Period Reference": "FFS - Load",
-                        "Reference": reference.strip(), "Billed qty": billed_qty_full,
-                        "Qty.": f"{qty} {qty_unit}", "Unit Price": f"{unit_price}",
-                        "Amount excl. GST": amt_excl_gst, "GST": gst, "Amount Incl. GST": amt_incl_gst
-                    })
-                    matched = True
-                    continue
-
-                # ---------------- Front Lift / Rental style ----------------
-                front_lift_match = re.match(
-                    r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+(\d{2}\.\d{2}\.\d{4} to \d{2}\.\d{2}\.\d{4})\s+(.+?)\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+) AUD",
-                    line
-                )
-                if front_lift_match:
-                    date, description, period, ref_details, qty_val, qty_unit, unit_price_val, unit_price_unit, amt_excl_gst, gst, amt_incl_gst = front_lift_match.groups()
-                    billed_qty_full = f"{qty_val} {qty_unit}"
-                    data.append({
-                        "Invoice No.": invoice_no, "Customer": customer, "Date": date,
-                        "Description": description.strip(), "Charge Type/Period Reference": period,
-                        "Reference": ref_details.strip(), "Billed qty": billed_qty_full,
-                        "Qty.": billed_qty_full, "Unit Price": f"{unit_price_val} {unit_price_unit}",
-                        "Amount excl. GST": amt_excl_gst, "GST": gst, "Amount Incl. GST": amt_incl_gst
-                    })
-                    matched = True
-                    continue
-
-                # ---------------- Manual Price ----------------
-                if "Manual Price" in line:
-                    try:
-                        date_match = re.match(r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+Manual Price\s+(.+)", line)
-                        if not date_match:
-                            continue
-                        date, desc1, desc2 = date_match.groups()
-                        description_lines = [f"{desc1.strip()} {desc2.strip()}"]
-
-                        lookahead = 1
-                        while i + lookahead < len(lines) and lookahead <= 5:
-                            next_line = lines[i + lookahead].strip()
-                            if next_line == "":
-                                break
-                            if (re.search(r"\d+\.?\d*\s+(TO\s+)?\d+\.?\d*", next_line) or "AUD" in next_line or "Billed Qty" in next_line):
-                                description_lines.append(next_line)
-                            else:
-                                break
-                            lookahead += 1
-
-                        full_block = " ".join(description_lines)
-
-                        totals_match = re.search(r"([\d,\.]+)\s+([\d,\.]+)\s+([\d,\.]+)\s+AUD", full_block)
-                        amt_excl_gst, gst, amt_incl_gst = totals_match.groups() if totals_match else ("", "", "")
-
-                        qty_match = re.search(r"(\d+\.?\d*)\s+TO\s+([\d,\.]+)", full_block)
-                        qty = f"{qty_match.group(1)} TO" if qty_match else ""
-                        unit_price = qty_match.group(2) if qty_match else ""
-
-                        billed_qty_match = re.search(r"Billed Qty\s+([\d\.]+)\s+TO", full_block)
-                        billed_qty = f"{billed_qty_match.group(1)} TO" if billed_qty_match else ""
-
-                        data.append({
-                            "Invoice No.": invoice_no, "Customer": customer, "Date": date,
-                            "Description": "Manual Price - " + description_lines[0],
-                            "Charge Type/Period Reference": "Manual Price",
-                            "Reference": "", "Billed qty": billed_qty or qty,
-                            "Qty.": qty, "Unit Price": unit_price,
-                            "Amount excl. GST": amt_excl_gst, "GST": gst, "Amount Incl. GST": amt_incl_gst
-                        })
-                        matched = True
-                        continue
-
-                    except Exception:
-                        continue
-
-                # ---------------- Learned Patterns ----------------
-                if not matched:
-                    for token_pattern, pattern_data in learned_patterns.items():
-                        regex = pattern_data["regex"]
-                        field_map = pattern_data["field_map"]
-                        charge_type = pattern_data.get("Charge Type", "")
-                        current_token_pattern = tokenize_line(line)
-
-                        if current_token_pattern == token_pattern:
-                            match = re.match(regex, line)
-                            if match:
-                                groups = match.groups()
-                                parsed = {
-                                    "Invoice No.": invoice_no,
-                                    "Customer": customer,
-                                    "Charge Type/Period Reference": charge_type,
-                                }
-
-                                # ✅ Safe group lookup
-                                for field, group_index in field_map.items():
-                                    if 0 < group_index <= len(groups):
-                                        parsed[field] = groups[group_index - 1]
-                                    else:
-                                        parsed[field] = ""  # fallback empty if invalid mapping
-
-                                data.append(parsed)
-                                matched = True
-                                break
-
-                # ---------------- Fallback Plastic Rolls ----------------
-                if not matched:
-                    ffs_plastic_roll_match = re.match(
-                        r"(\d{2}\.\d{2}\.\d{4})\s+(.+?)\s+FFS - Qty/Weight\s+([A-Z0-9]+)\s+([\d\.]+)\s+(\w+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+([\d\.]+)\s+AUD",
-                        line
-                    )
-                    if ffs_plastic_roll_match:
-                        date, description, reference, qty, qty_unit, unit_price, amt_excl_gst, gst, amt_incl_gst = ffs_plastic_roll_match.groups()
-                        billed_qty_full = f"{qty} {qty_unit}"
-                        data.append({
-                            "Invoice No.": invoice_no, "Customer": customer, "Date": date,
-                            "Description": description.strip(), "Charge Type/Period Reference": "FFS - Qty/Weight",
-                            "Reference": reference.strip(), "Billed qty": billed_qty_full,
-                            "Qty.": billed_qty_full, "Unit Price": unit_price,
-                            "Amount excl. GST": amt_excl_gst, "GST": gst, "Amount Incl. GST": amt_incl_gst
-                        })
-                        matched = True
-                        continue
-
-                # ---------------- Unmatched ----------------
-                if not matched and re.search(r"\d{2}\.\d{2}\.\d{4}.*AUD", line):
-                    missed_lines.append({
-                        "Page": page_num, "Line No.": i + 1, "Customer": customer,
-                        "Line": line, "Note": "Potential invoice data (unparsed)"
-                    })
-
-    # ---------------- Totals ----------------
-    total_payable_matches = re.findall(
-        r"Total Payable\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+AUD",
-        full_text, re.IGNORECASE
-    )
-
-    totals = {}
-    if total_payable_matches:
-        excl_total = gst_total = incl_total = 0.0
-        for excl_str, gst_str, incl_str in total_payable_matches:
-            excl_total += float(excl_str.replace(",", ""))
-            gst_total += float(gst_str.replace(",", ""))
-            incl_total += float(incl_str.replace(",", ""))
-        totals = {
-            "Amount excl. GST": round(excl_total, 2),
-            "GST": round(gst_total, 2),
-            "Amount Incl. GST": round(incl_total, 2)
-        }
-
-    return invoice_no, data, missed_lines, totals
-
-
-#invoice totals
-def show_invoice_totals(extracted_lines, invoice_totals, tolerance=0.05):
-    st.subheader("📊 Invoice Totals Check (Amount Incl. GST Only)")
-
-    df = pd.DataFrame(extracted_lines)
-    if df.empty:
-        st.warning("⚠️ No line items found to calculate totals.")
-        return
-
-    # Ensure Amount Incl. GST is numeric
-    if "Amount Incl. GST" in df.columns:
-        df["Amount Incl. GST"] = (
-            df["Amount Incl. GST"].astype(str)
-              .str.replace(",", "")
-              .str.extract(r"([\d\.]+)")[0]
-              .astype(float)
-              .fillna(0)
-        )
-
-    # Mark Manual Price lines
-    df['Is Manual Price'] = df['Charge Type/Period Reference'].str.contains("Manual Price", na=False)
-
-    # ---------------- Sum Amount Incl. GST ----------------
-    actual_total = df["Amount Incl. GST"].sum()
-
-    # ---------------- Compare with invoice total ----------------
-    expected_total = float(str(invoice_totals.get("Amount Incl. GST", 0)).replace(",", ""))
-    diff = actual_total - expected_total
-    within_tol = abs(diff) <= tolerance
-
-    # ---------------- Display ----------------
-    status = "✅ OK" if within_tol else "❌ Mismatch"
-    st.write(f"**Invoice Amount Incl. GST:** {expected_total:,.2f}")
-    st.write(f"**Sum of All Lines (Incl. Manual Price):** {actual_total:,.2f}")
-    st.write(f"**Difference:** {diff:,.2f} → {status}")
-
-    # Optional: breakdown of Manual Price lines
-    manual_total = df.loc[df['Is Manual Price'], 'Amount Incl. GST'].sum()
-    st.info(f"➡️ Sum of Manual Price lines: {manual_total:,.2f}")
-# -----------------------------
-# Learning widget
-# -----------------------------
-
-def tokenize_line(line: str) -> str:
-    """Convert a line into a token pattern for matching."""
-    tokens = line.split()
-    return " ".join(["<NUM>" if t.replace(".", "").isdigit() else "<TXT>" for t in tokens])
-
-# -----------------------------
-# Learning widget - Improved UX
-# -----------------------------
-import re, json
-import streamlit as st
-
-# -----------------------------
-# Tokenizer
-# -----------------------------
-def tokenize_line(line: str) -> str:
-    """Convert a line into a token pattern for matching."""
-    tokens = line.split()
-    return " ".join(
-        ["<NUM>" if t.replace(".", "").isdigit() else "<TXT>" for t in tokens]
-    )
-
-# -----------------------------
-# Heuristic guesser
-# -----------------------------
-def guess_field(token: str) -> str:
-    """Heuristic rules to auto-suggest field labels based on token shape."""
-    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", token):
-        return "Date"
-    if token.upper() == "AUD":
-        return "AUD"
-    if re.fullmatch(r"\d+(\.\d+)?", token):
-        return "Qty."
-    if re.fullmatch(r"\d{1,3}(?:,\d{3})*(\.\d{2})?", token):
-        return "Amount excl. GST"
-    if re.fullmatch(r"\d+(\.\d{2})?", token):
-        return "GST"
-    if re.fullmatch(r"[A-Za-z0-9\-\/\.]+", token) and any(c.isalpha() for c in token):
-        return "Reference"
-    return "Description"
-
-# -----------------------------
-# Field options (Excel headers)
-# -----------------------------
-FIELD_OPTIONS = {
-    "Ignore": "❌ Ignore",
-    "Date": "📅 Invoice Date",
-    "Description": "📝 Service / Item description",
-    "Reference": "🔖 Reference",
-    "Charge Type/Period Reference": "📆 Charge Type / Period Reference",
-    "Billed qty": "📊 Billed Quantity",
-    "Qty.": "🔢 Quantity",
-    "Qty Unit": "📦 Unit of measure (EA, KG, etc.)",
-    "Unit Price": "💲 Price per unit",
-    "Amount excl. GST": "💰 Net Amount",
-    "GST": "🧾 GST",
-    "Amount Incl. GST": "💲 Total Amount (incl. GST)",
-    "AUD": "💲 Currency AUD"
-}
-
-# -----------------------------
-# Load/save patterns
-# -----------------------------
-def load_patterns():
-    try:
-        with open("learned_patterns.json", "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_patterns(patterns):
-    with open("learned_patterns.json", "w") as f:
-        json.dump(patterns, f, indent=2)
-
-# -----------------------------
-# Learning Widget
-# -----------------------------
-def show_learning_widget(missed_lines):
-    st.subheader("🧠 Teach Me (Learning Widget)")
-
-    if not missed_lines:
-        st.info("✅ No unmatched lines found. Nothing to train.")
-        return
-
-    st.markdown("### Map tokens to invoice fields")
-
-    learned_patterns = load_patterns()
-
-    for idx, ml in enumerate(missed_lines[:10]):
-        st.markdown(f"**📄 Page {ml['Page']}, Line {ml['Line No.']}**")
-        line = ml["Line"].strip()
-        tokens = line.split()
-        token_pattern = tokenize_line(line)
-
-        # --- Prefill ---
-        suggested_fields, confidence = [], []
-        if token_pattern in learned_patterns:
-            field_map = learned_patterns[token_pattern].get("field_map", {})
-            group_to_field = {v: k for k, v in field_map.items()}
-            for i in range(len(tokens)):
-                suggested_fields.append(group_to_field.get(i + 1, "Ignore"))
-                confidence.append("✅ Saved")
-        else:
-            for tok in tokens:
-                suggested_fields.append(guess_field(tok))
-                confidence.append("🔵 Guessed")
-
-        # --- Dropdowns ---
-        dropdowns = []
-        cols = st.columns(len(tokens))
-        for i, token in enumerate(tokens):
-            with cols[i]:
-                choice = st.selectbox(
-                    f"{token} {confidence[i]}",
-                    list(FIELD_OPTIONS.keys()),
-                    index=list(FIELD_OPTIONS.keys()).index(suggested_fields[i])
-                    if suggested_fields[i] in FIELD_OPTIONS
-                    else 0,
-                    format_func=lambda x: FIELD_OPTIONS[x],
-                    key=f"dd_{idx}_{i}"
-                )
-                dropdowns.append(choice)
-
-        # --- Save mapping ---
-        if st.button(f"💾 Save Mapping for Line {idx+1}", key=f"save_{idx}"):
-            regex_parts = []
-            field_map = {}
-            group_index = 0
-
-            for i, label in enumerate(dropdowns):
-                token = tokens[i]
-                if label == "Ignore":
-                    regex_parts.append(re.escape(token))
-                elif label == "Date":
-                    regex_parts.append(r"(\d{2}\.\d{2}\.\d{4})")
-                    group_index += 1
-                    field_map["Date"] = group_index
-                elif label == "Qty.":
-                    regex_parts.append(r"([\d\.]+)")
-                    group_index += 1
-                    field_map["Qty."] = group_index
-                elif label == "Qty Unit":
-                    regex_parts.append(r"(\w+)")
-                    group_index += 1
-                    field_map["Qty Unit"] = group_index
-                elif label in ["Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST"]:
-                    regex_parts.append(r"([\d,\.]+)")
-                    group_index += 1
-                    field_map[label] = group_index
-                elif label == "Reference":
-                    regex_parts.append(r"([\w\-\/\.]+)")
-                    group_index += 1
-                    field_map["Reference"] = group_index
-                elif label in ["Description", "Charge Type/Period Reference"]:
-                    regex_parts.append(r"(.+?)")
-                    group_index += 1
-                    field_map[label] = group_index
-                elif label == "AUD":
-                    regex_parts.append(r"AUD")  # literal
-
-            final_regex = r"\s+".join(regex_parts)
-
-            try:
-                compiled = re.compile(final_regex)
-                m = compiled.match(line)
-                if not m:
-                    st.warning("⚠️ Pattern didn’t match this example line. Not saved.")
-                else:
-                    learned_patterns[token_pattern] = {
-                        "regex": final_regex,
-                        "field_map": field_map,
-                        "Charge Type": "Auto-Learned"
+                def base_row():
+                    return {
+                        "Invoice No.": inv["no"],
+                        "Invoice Date": inv["date"],
+                        "Account No.": inv["account"],
+                        "Customer Code": cust["code"],
+                        "Customer": cust["name"],
+                        "Source Page": page_num,
                     }
-                    save_patterns(learned_patterns)
-                    st.success("✅ Pattern saved successfully!")
-                    st.json({f: m.group(i) for f, i in field_map.items()})
-            except re.error as e:
-                st.error(f"❌ Regex error: {e}")
-# Pattern Management
-# -----------------------------
-# -----------------------------
-# Pattern Management with Search & Filter
-# -----------------------------
-def manage_patterns():
-    st.subheader("📚 Manage Learned Patterns")
 
-    learned_patterns = load_patterns()
-    if not learned_patterns:
-        st.info("No saved patterns yet.")
-        return
+                # ---------- Total Payable (end of table) ----------
+                m = TOTAL_PAYABLE_RE.match(text)
+                if m:
+                    invoice_totals.append({
+                        "Invoice No.": inv["no"],
+                        "Invoice Date": inv["date"],
+                        "Account No.": inv["account"],
+                        "Printed Ex GST": to_money(m["ex"]),
+                        "Printed GST": to_money(m["gst"]),
+                        "Printed Inc GST": to_money(m["inc"]),
+                        "Amount Due": inv["amount_due"],
+                    })
+                    open_charge, open_customer = None, False
+                    break  # everything after this is the remittance footer
 
-    field_options = list(FIELD_OPTIONS.keys())
+                # ---------- Customer total ----------
+                m = CUSTOMER_TOTAL_RE.match(text)
+                if m:
+                    customer_totals.append({
+                        "Invoice No.": inv["no"],
+                        "Customer Code": m["code"],
+                        "Customer (printed)": m["name"].strip(),
+                        "Printed Ex GST": to_money(m["ex"]),
+                        "Printed GST": to_money(m["gst"]),
+                        "Printed Inc GST": to_money(m["inc"]),
+                    })
+                    open_charge, open_customer = None, False
+                    continue
 
-    # --- Search + Filter controls ---
-    st.markdown("### 🔍 Search & Filter Patterns")
-    col1, col2 = st.columns([2,1])
-    with col1:
-        search_text = st.text_input("Search by token pattern / charge type:", "")
-    with col2:
-        filter_field = st.selectbox("Filter by field mapping:", ["(all)"] + field_options)
+                # ---------- Sub-total ----------
+                m = SUBTOTAL_RE.match(text)
+                if m:
+                    subtotals.append({
+                        "Invoice No.": inv["no"],
+                        "Customer Code": cust["code"],
+                        "Customer": cust["name"],
+                        "Sub-Total Code": m["code"],
+                        "Printed Qty": f'{m["qty"]} {m["qty_unit"]}',
+                        "Printed Ex GST": to_money(m["ex"]),
+                        "Printed GST": to_money(m["gst"]),
+                        "Printed Inc GST": to_money(m["inc"]),
+                    })
+                    for r in pending:
+                        r["Sub-Total Code"] = m["code"]
+                    pending = []
+                    open_charge, open_customer = None, False
+                    continue
 
-    # Apply filters
-    filtered_patterns = {}
-    for token_pattern, pdata in learned_patterns.items():
-        regex = pdata.get("regex", "")
-        ctype = pdata.get("Charge Type", "")
-        fmap = pdata.get("field_map", {})
+                # ---------- Billed Qty ----------
+                m = BILLED_QTY_RE.match(text)
+                if m:
+                    target = open_charge if open_charge is not None else (
+                        rows_out[-1] if rows_out else None)
+                    if target is not None and not target.get("Billed qty"):
+                        target["Billed qty"] = f"{m.group(1)} {m.group(2)}"
+                        target["Billed Qty Value"] = to_num(m.group(1))
+                        target["Billed Qty Unit"] = m.group(2)
+                    open_charge = None
+                    continue
 
-        # Search filter
-        if search_text and (search_text.lower() not in token_pattern.lower() and search_text.lower() not in ctype.lower() and search_text.lower() not in regex.lower()):
-            continue
+                # ---------- Customer header ----------
+                first_word = row["words"][0]["text"]
+                if (CUSTOMER_CODE_RE.match(first_word)
+                        and row["words"][0]["x0"] < bounds["description"]):
+                    cust = {
+                        "code": first_word,
+                        "name": " ".join(w["text"] for w in row["words"][1:]),
+                    }
+                    open_customer, open_charge, last_main = True, None, None
+                    continue
 
-        # Field filter
-        if filter_field != "(all)" and filter_field not in fmap:
-            continue
+                # ---------- Fuel levy ----------
+                if FUEL_RE.match(text):
+                    m, text_words = split_tail(row, TAIL_FUEL_RE)
+                    if m:
+                        cols = split_columns(text_words, bounds)
+                        fuel_type = ("Fuel Levy - Load"
+                                     if "load" in cols["charge_type"].lower()
+                                     else "Fuel Levy - Qty/Weight")
+                        r = base_row()
+                        r.update({
+                            "Date": last_main["Date"] if last_main else "",
+                            "Description": "OPR Fuel Levy",
+                            "Charge Type": fuel_type,
+                            "Reference": cols["reference"],
+                            "Qty.": f'{m["qty"]} {m["qty_unit"]}',
+                            "Qty Value": to_num(m["qty"]),
+                            "Qty Unit": m["qty_unit"],
+                            "Unit Price": (f'{m["unit_price"]} {m["price_unit"]}'
+                                           if m["unit_price"] else ""),
+                            "Unit Price Value": to_num(m["unit_price"]),
+                            "Price Unit": m["price_unit"] or "",
+                            "Item Total": to_money(m["item"]),
+                            "Is Fuel Levy": True,
+                        })
+                        # Link to the charge it belongs to (same reference).
+                        if last_main is not None and (
+                                last_main["Reference"].split(" ")[0]
+                                == r["Reference"].split(" ")[0]):
+                            last_main["Fuel Levy (linked)"] = round(
+                                (last_main.get("Fuel Levy (linked)") or 0)
+                                + r["Item Total"], 2)
+                            r["Date"] = last_main["Date"]
+                        rows_out.append(r)
+                        pending.append(r)
+                        open_charge, open_customer = r, False
+                        continue
 
-        filtered_patterns[token_pattern] = pdata
+                # ---------- Main charge ----------
+                m, text_words = split_tail(row, TAIL_UNIT_PRICE_RE)
+                has_unit_price = m is not None
+                if not m:
+                    m, text_words = split_tail(row, TAIL_LOAD_RE)
+                if m and text_words:
+                    cols = split_columns(text_words, bounds)
+                    if DATE_RE.match(cols["first"]):
+                        ctype, p_from, p_to = parse_charge_type(cols["charge_type"])
+                        r = base_row()
+                        r.update({
+                            "Date": cols["first"],
+                            "Description": cols["description"],
+                            "Charge Type": ctype,
+                            "Period From": p_from,
+                            "Period To": p_to,
+                            "Reference": cols["reference"],
+                            "Qty.": f'{m["qty"]} {m["qty_unit"]}',
+                            "Qty Value": to_num(m["qty"]),
+                            "Qty Unit": m["qty_unit"],
+                            "Unit Price": (f'{m["unit_price"]} {m["price_unit"]}'
+                                           if has_unit_price else ""),
+                            "Unit Price Value": (to_num(m["unit_price"])
+                                                 if has_unit_price else None),
+                            "Price Unit": m["price_unit"] if has_unit_price else "",
+                            "Item Total": to_money(m["item"]),
+                            "Amount excl. GST": to_money(m["ex"]),
+                            "GST": to_money(m["gst"]),
+                            "Amount Incl. GST": to_money(m["inc"]),
+                            "Is Fuel Levy": False,
+                        })
+                        rows_out.append(r)
+                        pending.append(r)
+                        open_charge, last_main, open_customer = r, r, False
+                        continue
 
-    st.caption(f"Showing {len(filtered_patterns)} of {len(learned_patterns)} patterns")
+                # ---------- Wrapped text (continuation lines) ----------
+                cols = split_columns(row["words"], bounds)
+                if open_charge is not None and not cols["first"]:
+                    c = open_charge
+                    c["Description"] = join(c.get("Description", ""), cols["description"])
+                    ct = cols["charge_type"]
+                    if ct:
+                        if c["Charge Type"] == "Period Charge" and not c.get("Period To"):
+                            pm = re.match(rf"^({DATE})\b\s*(.*)$", ct)
+                            if pm:
+                                c["Period To"] = pm.group(1)
+                                ct = pm.group(2)
+                        if ct:
+                            c["Charge Type"] = join(c["Charge Type"], ct)
+                    ref = cols["reference"]
+                    # A lone "A" under the reference is a PDF artefact.
+                    if ref and ref != "A":
+                        c["Reference"] = join(c.get("Reference", ""), ref)
+                    continue
 
-    # --- Display patterns ---
-    for token_pattern, pattern_data in list(filtered_patterns.items()):
-        with st.expander(f"🔑 Token Pattern: {token_pattern}"):
-            # Regex editor
-            new_regex = st.text_area(
-                "📝 Current Regex Pattern",
-                value=pattern_data.get("regex", ""),
-                height=80,
-                key=f"regex_{token_pattern}"
-            )
+                if open_customer and not cols["first"]:
+                    cust["name"] = join(cust["name"], text)
+                    # Keep rows already created for this customer in sync.
+                    continue
 
-            # Charge type
-            new_charge_type = st.text_input(
-                "Charge Type / Period Reference",
-                value=pattern_data.get("Charge Type", "Custom"),
-                key=f"charge_{token_pattern}"
-            )
+                # ---------- Anything else that looks like money ----------
+                if re.search(AMT, text) or DATE_RE.match(first_word):
+                    unmatched.append({
+                        "Page": page_num,
+                        "Invoice No.": inv["no"],
+                        "Customer Code": cust["code"],
+                        "Line": text,
+                        "Reason": "Row contains amounts/date but matched no pattern",
+                    })
 
-            # Field mapping
-            st.markdown("**🔗 Field Mapping (groups → invoice fields):**")
-            field_map = pattern_data.get("field_map", {})
-            new_field_map = {}
-            max_groups = max(field_map.values()) if field_map else 5
-            for group_index in range(1, max_groups + 1):
-                current_field = next((k for k, v in field_map.items() if v == group_index), "(ignore)")
-                selection = st.selectbox(
-                    f"Group {group_index}",
-                    field_options,
-                    index=field_options.index(current_field) if current_field in field_options else 0,
-                    key=f"{token_pattern}_group_{group_index}"
-                )
-                if selection != "(ignore)":
-                    new_field_map[selection] = group_index
+    invoice_df = pd.DataFrame(rows_out)
+    for col in INVOICE_COLUMNS:
+        if col not in invoice_df.columns:
+            invoice_df[col] = None
+    invoice_df = invoice_df[INVOICE_COLUMNS]
 
-            # Test regex
-            st.markdown("**🧪 Test Regex**")
-            test_line = st.text_input(
-                "Paste a sample invoice line",
-                "",
-                key=f"test_{token_pattern}"
-            )
-            if st.button(f"▶️ Run Test ({token_pattern})"):
-                try:
-                    match = re.match(new_regex, test_line)
-                    if match:
-                        results = {f: match.group(i) for f, i in new_field_map.items() if i <= len(match.groups())}
-                        if results:
-                            st.success("✅ Match Found!")
-                            st.json(results)
-                        else:
-                            st.warning("⚠️ Regex matched, but no fields mapped.")
-                    else:
-                        st.error("❌ No match. Check your regex or sample line.")
-                except re.error as e:
-                    st.error(f"⚠️ Invalid regex: {e}")
+    invoice_df["Line Check"] = invoice_df.apply(line_check, axis=1)
 
-            # Save / Delete
-            colA, colB = st.columns(2)
-            with colA:
-                if st.button(f"💾 Save Changes ({token_pattern})"):
-                    learned_patterns[token_pattern]["regex"] = new_regex
-                    learned_patterns[token_pattern]["Charge Type"] = new_charge_type
-                    learned_patterns[token_pattern]["field_map"] = new_field_map
-                    save_patterns(learned_patterns)
-                    st.success("✅ Pattern updated!")
-            with colB:
-                if st.button(f"🗑️ Delete Pattern ({token_pattern})"):
-                    del learned_patterns[token_pattern]
-                    save_patterns(learned_patterns)
-                    st.warning("❌ Pattern deleted!")
-                    st.experimental_rerun()
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Invoice PDF → Excel", layout="wide")
-st.title("📄 OPAL Invoice PDF → Excel Extractor")
-tab1, tab2, tab3 = st.tabs(["📂 Upload & Extract", "🧠 Teach Me", "📚 Manage Patterns"])
+    return (
+        invoice_df,
+        build_invoice_validation(invoice_df, invoice_totals),
+        build_customer_validation(invoice_df, customer_totals),
+        build_subtotal_validation(invoice_df, subtotals),
+        pd.DataFrame(unmatched, columns=[
+            "Page", "Invoice No.", "Customer Code", "Line", "Reason"]),
+    )
 
 
-uploaded_file = st.file_uploader("Upload an Invoice PDF", type=["pdf"])
+# ============================================================
+# VALIDATION
+# ============================================================
 
-if uploaded_file:
-    with st.spinner("Processing PDF... please wait ⏳"):
-        file_stream = io.BytesIO(uploaded_file.read())
-        invoice_no, data, missed_lines, totals = process_pdf(file_stream)
+def line_check(r):
+    if r["Is Fuel Levy"]:
+        return "Fuel levy (included in parent charge)"
+    problems = []
+    if not close(r["Amount excl. GST"] + r["GST"], r["Amount Incl. GST"]):
+        problems.append("Ex GST + GST != Incl. GST")
+    fuel = r["Fuel Levy (linked)"] if pd.notna(r["Fuel Levy (linked)"]) else 0
+    # Manual / period charges show Item Total 0.00; their Ex GST is the price.
+    if r["Item Total"] and not close(r["Item Total"] + fuel, r["Amount excl. GST"]):
+        problems.append("Item Total + Fuel != Ex GST")
+    if r["Charge Type"] in ("Manual Price", "Period Charge") and r["Unit Price Value"]:
+        expected = round(r["Qty Value"] * r["Unit Price Value"], 2)
+        if not close(expected, r["Amount excl. GST"]):
+            problems.append("Qty x Unit Price != Ex GST")
+    return "OK" if not problems else "; ".join(problems)
 
-    st.success(f"✅ Extracted {len(data)} lines | ⚠️ {len(missed_lines)} unmatched")
 
-    if data:
-        st.subheader("Extracted Data (preview)")
-        st.dataframe(pd.DataFrame(data).head(20))
+def _sum_main(invoice_df, keys):
+    main = invoice_df[invoice_df["Is Fuel Levy"] != True]
+    return (
+        main.groupby(keys, dropna=False)
+        .agg(**{
+            "Extracted Ex GST": ("Amount excl. GST", "sum"),
+            "Extracted GST": ("GST", "sum"),
+            "Extracted Inc GST": ("Amount Incl. GST", "sum"),
+            "Charge Lines": ("Amount excl. GST", "count"),
+        })
+        .round(2)
+        .reset_index()
+    )
 
-    # 🔹 Show invoice totals summary instead of raw JSON
-    if data and totals:
-        show_invoice_totals(data, totals, tolerance=0.05)
 
-    if missed_lines:
-        st.subheader("Unmatched Lines (first 10)")
-        for row in missed_lines[:10]:
-            st.text(f"[Page {row['Page']} | Line {row['Line No.']}] {row['Line']}")
+def _compare(extracted, printed, keys):
+    if printed.empty:
+        printed = pd.DataFrame(columns=keys + [
+            "Printed Ex GST", "Printed GST", "Printed Inc GST"])
+    result = pd.merge(extracted, printed, on=keys, how="outer")
+    for part in ("Ex GST", "GST", "Inc GST"):
+        result[f"Diff {part}"] = (
+            result[f"Extracted {part}"].fillna(0) - result[f"Printed {part}"].fillna(0)
+        ).round(2)
 
-        # Learning widget
-        show_learning_widget(missed_lines)
+    def status(r):
+        if pd.isna(r["Printed Inc GST"]):
+            return "NO PRINTED TOTAL"
+        if pd.isna(r["Extracted Inc GST"]):
+            return "NO LINES EXTRACTED"
+        ok = all(abs(r[f"Diff {p}"]) <= TOLERANCE for p in ("Ex GST", "GST", "Inc GST"))
+        return "PASS" if ok else "FAIL"
 
-    # Pattern manager always available
-    manage_patterns()
+    result["Validation"] = result.apply(status, axis=1) if len(result) else []
+    return result
 
-    # --- Save to Excel ---
+
+def build_invoice_validation(invoice_df, invoice_totals):
+    keys = ["Invoice No."]
+    printed = pd.DataFrame(invoice_totals)
+    result = _compare(_sum_main(invoice_df, keys), printed, keys)
+    if "Amount Due" in result.columns:
+        result["Amount Due Check"] = result.apply(
+            lambda r: "PASS" if close(r["Amount Due"], r["Printed Inc GST"]) else "FAIL",
+            axis=1)
+    return result
+
+
+def build_customer_validation(invoice_df, customer_totals):
+    keys = ["Invoice No.", "Customer Code"]
+    extracted = _sum_main(invoice_df, keys + ["Customer"])
+    return _compare(extracted, pd.DataFrame(customer_totals), keys)
+
+
+def build_subtotal_validation(invoice_df, subtotals):
+    keys = ["Invoice No.", "Customer Code", "Sub-Total Code"]
+    printed = pd.DataFrame(subtotals)
+    if not printed.empty:
+        printed = printed.drop(columns=["Customer"])
+    return _compare(_sum_main(invoice_df, keys), printed, keys)
+
+
+# ============================================================
+# EXCEL EXPORT
+# ============================================================
+
+def create_excel(sheets):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        if data:
-            pd.DataFrame(data).to_excel(writer, sheet_name="Invoice Data", index=False)
+        for name, df in sheets.items():
+            df.to_excel(writer, sheet_name=name, index=False)
+        for ws in writer.book.worksheets:
+            ws.freeze_panes = "A2"
+            for column_cells in ws.columns:
+                width = max(len(str(c.value)) if c.value is not None else 0
+                            for c in column_cells)
+                ws.column_dimensions[column_cells[0].column_letter].width = min(
+                    max(width + 2, 10), 45)
+    return output.getvalue()
 
-        if missed_lines:
-            pd.DataFrame(missed_lines).to_excel(writer, sheet_name="Unmatched Lines", index=False)
 
-        if totals:
-            # Save invoice totals as a single-row sheet
-            pd.DataFrame([totals]).to_excel(writer, sheet_name="Invoice Totals", index=False)
+def extract_all(file_stream):
+    invoice_df, inv_val, cust_val, sub_val, unmatched = process_pdf(file_stream)
+    return {
+        "Invoice Data": invoice_df,
+        "Invoice Validation": inv_val,
+        "Customer Validation": cust_val,
+        "Sub-Total Validation": sub_val,
+        "Unmatched Lines": unmatched,
+    }
 
-    # ✅ Streamlit download button
-    st.download_button(
-        label="📥 Download Excel",
-        data=output.getvalue(),
-        file_name=f"Opal_Invoice_{invoice_no or 'Unknown'}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+
+def run_streamlit():
+    import streamlit as st
+
+    st.set_page_config(page_title="Opal Invoice PDF → Excel", page_icon="📄",
+                       layout="wide")
+    st.title("📄 Opal Invoice PDF → Excel Extractor")
+    st.caption("Extracts Opal Recycling invoice charges and fuel levies, and "
+               "reconciles every line, sub-total, customer total and invoice total.")
+
+    uploaded = st.file_uploader("Upload an Opal invoice PDF", type=["pdf"])
+    if not uploaded:
+        return
+
+    with st.spinner("Processing PDF..."):
+        try:
+            sheets = extract_all(io.BytesIO(uploaded.read()))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"❌ Error while processing PDF: {e}")
+            st.exception(e)
+            st.stop()
+
+    df = sheets["Invoice Data"]
+    inv_val = sheets["Invoice Validation"]
+    cust_val = sheets["Customer Validation"]
+    sub_val = sheets["Sub-Total Validation"]
+    unmatched = sheets["Unmatched Lines"]
+    bad_lines = df[~df["Line Check"].isin(
+        ["OK", "Fuel levy (included in parent charge)"])]
+
+    c = st.columns(6)
+    c[0].metric("Invoices", df["Invoice No."].nunique())
+    c[1].metric("Charges", int((df["Is Fuel Levy"] != True).sum()))
+    c[2].metric("Fuel levies", int((df["Is Fuel Levy"] == True).sum()))
+    c[3].metric("Invoice PASS", f'{(inv_val["Validation"] == "PASS").sum()}/{len(inv_val)}')
+    c[4].metric("Customer PASS", f'{(cust_val["Validation"] == "PASS").sum()}/{len(cust_val)}')
+    c[5].metric("Unmatched rows", len(unmatched))
+
+    all_ok = (
+        len(inv_val) > 0
+        and (inv_val["Validation"] == "PASS").all()
+        and (cust_val["Validation"] == "PASS").all()
+        and (sub_val["Validation"] == "PASS").all()
+        and bad_lines.empty and unmatched.empty
     )
+    if all_ok:
+        st.success("✅ Every line, sub-total, customer total and invoice total reconciles.")
+    else:
+        st.error("⚠️ Some checks failed — see the validation tabs.")
 
+    tabs = st.tabs(list(sheets.keys()))
+    for tab, (name, frame) in zip(tabs, sheets.items()):
+        with tab:
+            if frame.empty:
+                st.info("Nothing to show.")
+            else:
+                st.dataframe(frame, use_container_width=True, height=600)
+
+    numbers = df["Invoice No."].dropna().astype(str).unique()
+    file_name = (f"Opal_Invoice_{numbers[0]}.xlsx" if len(numbers) == 1
+                 else "Opal_Invoice_Extract.xlsx")
+    st.download_button(
+        "📥 Download Excel", data=create_excel(sheets), file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def run_cli(pdf_path, out_path=None):
+    with open(pdf_path, "rb") as f:
+        sheets = extract_all(io.BytesIO(f.read()))
+    out_path = out_path or re.sub(r"\.pdf$", "", pdf_path, flags=re.I) + ".xlsx"
+    with open(out_path, "wb") as f:
+        f.write(create_excel(sheets))
+
+    df = sheets["Invoice Data"]
+    print(f"Rows: {len(df)}  (charges {(df['Is Fuel Levy'] != True).sum()}, "
+          f"fuel levies {(df['Is Fuel Levy'] == True).sum()})")
+    for name in ("Invoice Validation", "Customer Validation", "Sub-Total Validation"):
+        v = sheets[name]["Validation"].value_counts().to_dict()
+        print(f"{name}: {v}")
+    print("Line checks:", df["Line Check"].value_counts().to_dict())
+    print("Unmatched rows:", len(sheets["Unmatched Lines"]))
+    print("Saved:", out_path)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1].lower().endswith(".pdf"):
+        run_cli(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    else:
+        run_streamlit()
