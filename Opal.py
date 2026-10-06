@@ -1,43 +1,56 @@
-import pdfplumber
-import pandas as pd
-import re
 import io
+import re
+from decimal import Decimal, InvalidOperation
+
+import pandas as pd
+import pdfplumber
 import streamlit as st
-from collections import defaultdict
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 DATE_RE = r"\d{2}\.\d{2}\.\d{4}"
-NUMBER_RE = r"[\d,]+\.\d+"
 
-CUSTOMER_RE = re.compile(
-    r"^(R-[A-Z0-9]+)\s+(.+)$",
+# Opal customer code
+CUSTOMER_CODE_RE = re.compile(
+    r"^(R-[A-Z0-9]+)\s+(.+?)\s*$",
     re.IGNORECASE
 )
 
+# Invoice number
 INVOICE_RE = re.compile(
     r"Invoice No\.\s*(\d+)",
     re.IGNORECASE
 )
 
+# Invoice date
+INVOICE_DATE_RE = re.compile(
+    r"\bDate\s+(\d{2}\.\d{2}\.\d{4})\b",
+    re.IGNORECASE
+)
+
+# Charge markers
+FFS_QTY_RE = re.compile(r"\bFFS\s*-\s*Qty/Weight\b", re.IGNORECASE)
+FFS_LOAD_RE = re.compile(r"\bFFS\s*-\s*Load\b", re.IGNORECASE)
+MANUAL_RE = re.compile(r"\bManual\s+Price\b", re.IGNORECASE)
+
+# Fuel levy
+FUEL_RE = re.compile(
+    r"^OPR\s+Fuel\s+Levy",
+    re.IGNORECASE
+)
+
+# Billed quantity
 BILLED_QTY_RE = re.compile(
-    r"Billed Qty\s+([\d,]+\.\d+)\s+([A-Za-z]+)",
+    r"\bBilled\s+Qty\s+([\d,]+\.\d+)\s+([A-Za-z]+)\b",
     re.IGNORECASE
 )
 
+# Printed totals
 TOTAL_PAYABLE_RE = re.compile(
-    r"Total Payable\s+"
-    r"([\d,]+\.\d{2})\s+"
-    r"([\d,]+\.\d{2})\s+"
-    r"([\d,]+\.\d{2})\s+AUD",
-    re.IGNORECASE
-)
-
-CUSTOMER_TOTAL_RE = re.compile(
-    r"^(R-[A-Z0-9]+).*?\(TOTAL\)\s+"
+    r"Total\s+Payable\s+"
     r"([\d,]+\.\d{2})\s+"
     r"([\d,]+\.\d{2})\s+"
     r"([\d,]+\.\d{2})\s+AUD",
@@ -45,9 +58,18 @@ CUSTOMER_TOTAL_RE = re.compile(
 )
 
 SUBTOTAL_RE = re.compile(
-    r"SUB-TOTAL\s+\S+\s+"
+    r"SUB-TOTAL\s+"
+    r"(\S+)\s+"
     r"([\d,]+\.\d+)\s+"
-    r"[A-Za-z]+\s+"
+    r"([A-Za-z]+)\s+"
+    r"([\d,]+\.\d{2})\s+"
+    r"([\d,]+\.\d{2})\s+"
+    r"([\d,]+\.\d{2})\s+AUD",
+    re.IGNORECASE
+)
+
+CUSTOMER_TOTAL_RE = re.compile(
+    r"^(R-[A-Z0-9]+)-(.+?)\s+\(TOTAL\)\s+"
     r"([\d,]+\.\d{2})\s+"
     r"([\d,]+\.\d{2})\s+"
     r"([\d,]+\.\d{2})\s+AUD",
@@ -56,253 +78,800 @@ SUBTOTAL_RE = re.compile(
 
 
 # ============================================================
-# HELPERS
+# HELPER FUNCTIONS
 # ============================================================
 
+def clean_line(line):
+    """
+    Clean PDF extraction artefacts without destroying useful data.
+    """
+    if line is None:
+        return ""
+
+    line = str(line).replace("\xa0", " ")
+    line = re.sub(r"\s+", " ", line).strip()
+
+    # Opal PDFs sometimes produce a standalone A between reference
+    # and numeric details.
+    if line.upper() == "A":
+        return ""
+
+    return line
+
+
 def clean_number(value):
-    """Convert 1,234.56 -> 1234.56"""
+    """
+    Convert Opal number strings such as 1,397.91 into float.
+    """
     if value is None or value == "":
         return None
 
     try:
         return float(str(value).replace(",", ""))
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
-def normalise_line(line):
+def money(value):
     """
-    Clean PDF extraction artefacts while preserving meaningful text.
+    Convert number to 2-decimal float.
     """
-    if not line:
+    number = clean_number(value)
+
+    if number is None:
+        return None
+
+    return round(number, 2)
+
+
+def normalise_customer_name(name):
+    """
+    Clean customer names while preserving the actual customer text.
+    """
+    if not name:
         return ""
 
-    line = line.replace("\xa0", " ")
-    line = line.replace("\u200b", "")
-    line = re.sub(r"\s+", " ", line)
+    name = clean_line(name)
 
-    return line.strip()
+    # Do not allow obvious headers/footers to become customer names.
+    bad_starts = [
+        "Customer/",
+        "Date",
+        "Description",
+        "Period/",
+        "Charge Type",
+        "Reference",
+        "Billed Qty",
+        "SUB-TOTAL",
+        "Total Payable",
+        "Opal Packaging",
+        "ABN ",
+        "Tax Invoice",
+        "Biller Code",
+        "Telephone",
+        "Please remit",
+        "Account Enquiries",
+    ]
+
+    for bad in bad_starts:
+        if name.lower().startswith(bad.lower()):
+            return ""
+
+    return name
 
 
-def is_date_line(line):
-    return bool(re.match(rf"^{DATE_RE}\b", line))
-
-
-def extract_date(line):
-    match = re.match(rf"^({DATE_RE})\b", line)
-    return match.group(1) if match else ""
-
-
-def remove_date(line):
-    return re.sub(rf"^{DATE_RE}\s*", "", line, count=1)
-
-
-def extract_invoice_number(line):
-    match = INVOICE_RE.search(line)
-    return match.group(1) if match else ""
-
-
-def parse_money_tail(line):
+def is_customer_line(line):
     """
-    Parse the numeric section at the end of an Opal charge line.
+    Detect real customer/site lines.
 
-    Two common structures exist.
-
-    Qty/Weight / Manual:
-        qty unit
-        unit_price price_unit
-        item_total
-        ex_gst
-        gst
-        inc_gst
-        AUD
-
-    Load:
-        qty unit
-        unit_price
-        ex_gst
-        gst
-        inc_gst
-        AUD
+    Example:
+        R-AUS5019 Australian Clutch Services
+        R-HAR4009 Hart Sport Brendale (Wasteflex)
     """
 
-    # --------------------------------------------------------
-    # Pattern with PRICE UNIT + 4 monetary values
-    # --------------------------------------------------------
+    if not line:
+        return False
 
-    pattern_4 = re.compile(
-        rf"(?P<qty>{NUMBER_RE})\s+"
-        rf"(?P<qty_unit>[A-Za-z]+)\s+"
-        rf"(?P<unit_price>{NUMBER_RE})\s+"
-        rf"(?P<price_unit>[A-Za-z]+)\s+"
-        rf"(?P<item_total>{NUMBER_RE})\s+"
-        rf"(?P<ex_gst>{NUMBER_RE})\s+"
-        rf"(?P<gst>{NUMBER_RE})\s+"
-        rf"(?P<inc_gst>{NUMBER_RE})\s+AUD$",
-        re.IGNORECASE
+    # Never treat customer total lines as customer headers.
+    if "(TOTAL)" in line.upper():
+        return False
+
+    # Never treat invoice account headers as customer headers.
+    if line.lower().startswith("account no."):
+        return False
+
+    return CUSTOMER_CODE_RE.match(line) is not None
+
+
+def parse_customer_line(line):
+    match = CUSTOMER_CODE_RE.match(line)
+
+    if not match:
+        return None, None
+
+    code = match.group(1).strip()
+    name = normalise_customer_name(match.group(2))
+
+    if not name:
+        return None, None
+
+    return code, name
+
+
+def is_date_start(line):
+    return re.match(
+        rf"^{DATE_RE}\b",
+        line
+    ) is not None
+
+
+def is_header_or_footer(line):
+    """
+    Lines which should never be treated as invoice charge lines.
+    """
+
+    upper = line.upper()
+
+    blocked = [
+        "CUSTOMER/",
+        "DESCRIPTION PERIOD",
+        "CHARGE TYPE",
+        "REFERENCE QTY",
+        "BILLED QTY",
+        "SUB-TOTAL",
+        "TOTAL PAYABLE",
+        "AMOUNT DUE",
+        "PAYMENT TERMS",
+        "BILLER CODE",
+        "TELEPHONE & INTERNET BANKING",
+        "PLEASE REMIT PAYMENT",
+        "ACCOUNT ENQUIRIES",
+        "ALL DEALINGS WITH",
+        "OPAL PACKAGING AUSTRALIA",
+        "OPAL RECYCLING",
+        "TAX INVOICE",
+        "ABN ",
+        "PAGE ",
+    ]
+
+    return any(x in upper for x in blocked)
+
+
+def get_billed_qty(lines, start_index, lookahead=4):
+    """
+    Look ahead for:
+        Billed Qty 5.000 BL
+    """
+
+    end = min(
+        len(lines),
+        start_index + lookahead + 1
     )
 
-    match = pattern_4.search(line)
+    for j in range(start_index, end):
 
-    if match:
-        result = match.groupdict()
-        result["format"] = "WITH_ITEM_TOTAL"
-        return result
+        line = clean_line(lines[j])
 
-    # --------------------------------------------------------
-    # Pattern without PRICE UNIT + 3 monetary values
-    # --------------------------------------------------------
-
-    pattern_3 = re.compile(
-        rf"(?P<qty>{NUMBER_RE})\s+"
-        rf"(?P<qty_unit>[A-Za-z]+)\s+"
-        rf"(?P<unit_price>{NUMBER_RE})\s+"
-        rf"(?P<ex_gst>{NUMBER_RE})\s+"
-        rf"(?P<gst>{NUMBER_RE})\s+"
-        rf"(?P<inc_gst>{NUMBER_RE})\s+AUD$",
-        re.IGNORECASE
-    )
-
-    match = pattern_3.search(line)
-
-    if match:
-        result = match.groupdict()
-        result["price_unit"] = ""
-        result["item_total"] = ""
-
-        result["format"] = "WITHOUT_ITEM_TOTAL"
-
-        return result
-
-    return None
-
-
-def parse_fuel_levy_line(line):
-    """
-    Parse:
-
-    OPR Fuel Levy-Qty/Wt 24099263
-    1.000 FL 1.50 FL 1.50
-
-    or:
-
-    OPR Fuel Levy-Load 409524
-    1.000 OT 13.30
-    """
-
-    fuel_match = re.search(
-        r"^(?P<description>OPR Fuel Levy-(?:Qty/Wt|Load))\s+"
-        r"(?P<reference>\S+)\s+"
-        rf"(?P<qty>{NUMBER_RE})\s+"
-        r"(?P<qty_unit>[A-Za-z]+)\s+"
-        rf"(?P<rate>{NUMBER_RE})"
-        r"(?:\s+(?P<rate_unit>[A-Za-z]+))?"
-        rf"\s+(?P<amount>{NUMBER_RE})"
-        r"(?:\s+AUD)?$",
-        line,
-        re.IGNORECASE
-    )
-
-    if not fuel_match:
-        return None
-
-    result = fuel_match.groupdict()
-
-    return result
-
-
-def extract_billed_qty(lines, start_index, max_lookahead=3):
-    """
-    Look immediately after a charge line for:
-
-        Billed Qty 1.000 FL
-    """
-
-    for offset in range(1, max_lookahead + 1):
-
-        index = start_index + offset
-
-        if index >= len(lines):
-            break
-
-        line = lines[index]
+        if not line:
+            continue
 
         match = BILLED_QTY_RE.search(line)
 
         if match:
+            qty = match.group(1)
+            unit = match.group(2)
 
             return {
-                "billed_qty": match.group(1),
-                "billed_qty_unit": match.group(2),
-                "line_index": index
+                "Billed qty": f"{qty} {unit}",
+                "Billed Qty Value": clean_number(qty),
+                "Billed Qty Unit": unit
             }
 
-        # Don't search through another actual dated charge.
-        if is_date_line(line):
-            break
-
     return {
-        "billed_qty": "",
-        "billed_qty_unit": "",
-        "line_index": None
+        "Billed qty": "",
+        "Billed Qty Value": None,
+        "Billed Qty Unit": ""
     }
 
 
-def is_structural_line(line):
+def find_numeric_line(lines, start_index, max_lookahead=5):
+    """
+    Find the actual numeric charge line after a charge description.
 
-    structural_patterns = [
-        r"^SUB-TOTAL\b",
-        r"^\(?R-[A-Z0-9]+.*\(TOTAL\)",
-        r"^Total Payable\b",
-        r"^Biller Code:",
-        r"^Ref:",
-        r"^Telephone & Internet Banking",
-        r"^Please remit",
-        r"^Account Enquiries:",
-        r"^Page \d+ of \d+",
-        r"^Customer/Date",
-        r"^Description Period/",
-        r"^Reference Qty",
-        r"^Amount Ex\. GST",
-    ]
+    This is important because Opal's PDF extraction can produce:
 
-    return any(
-        re.search(pattern, line, re.IGNORECASE)
-        for pattern in structural_patterns
+        01.09.2026 ... FFS - Qty/Weight 50001003546705
+        A
+         1.635 TO 9.01 BL ...
+
+    or:
+
+        16.09.2026 ... Manual Price 24944
+        QR26-1590
+         1.000 FL 150.00 EA ...
+
+    """
+
+    end = min(
+        len(lines),
+        start_index + max_lookahead + 1
     )
 
+    for j in range(start_index, end):
 
-def looks_like_charge(line):
+        line = clean_line(lines[j])
 
-    charge_keywords = [
-        "FFS - Qty/Weight",
-        "FFS - Load",
-        "Manual Price",
-        "OPR Fuel Levy-Qty/Wt",
-        "OPR Fuel Levy-Load",
-    ]
+        if not line:
+            continue
 
-    return any(
-        keyword.lower() in line.lower()
-        for keyword in charge_keywords
-    )
+        # Do not accidentally consume another charge.
+        if FUEL_RE.match(line):
+            return None, None
 
+        if is_date_start(line):
+            return None, None
 
-def looks_like_customer(line):
+        # Numeric detail lines normally contain AUD.
+        if "AUD" in line.upper():
+            return j, line
 
-    return bool(CUSTOMER_RE.match(line))
+        # Some PDF extraction variants may omit AUD.
+        # Require several numeric tokens before accepting.
+        numeric_count = len(
+            re.findall(
+                r"\b\d[\d,]*\.\d+\b",
+                line
+            )
+        )
+
+        if numeric_count >= 4:
+            return j, line
+
+    return None, None
 
 
 # ============================================================
-# MAIN PARSER
+# MAIN CHARGE PARSERS
+# ============================================================
+
+def parse_qty_weight_numeric_line(line):
+    """
+    Parse:
+
+    1.635 TO 9.01 BL 45.05 47.50 4.75 52.25 AUD
+
+    or:
+
+    1.000 FL 27.00 FL 27.00 28.50 2.85 31.35 AUD
+
+    Structure:
+
+        Qty
+        Qty Unit
+        Unit Price
+        Price Unit
+        Item Total
+        Ex GST
+        GST
+        Inc GST
+        AUD
+    """
+
+    line = clean_line(line)
+
+    # Remove trailing PDF artefacts.
+    line = re.sub(
+        r"\s+A\s*$",
+        "",
+        line,
+        flags=re.IGNORECASE
+    )
+
+    pattern = re.compile(
+        r"^"
+        r"([\d,]+\.\d+)\s+"       # qty
+        r"([A-Za-z]+)\s+"         # qty unit
+        r"([\d,]+\.\d+)\s+"       # unit price
+        r"([A-Za-z]+)\s+"         # price unit
+        r"([\d,]+\.\d+)\s+"       # item total
+        r"([\d,]+\.\d+)\s+"       # ex GST
+        r"([\d,]+\.\d+)\s+"       # GST
+        r"([\d,]+\.\d+)"
+        r"(?:\s+AUD)?$",
+        re.IGNORECASE
+    )
+
+    match = pattern.match(line)
+
+    if not match:
+        return None
+
+    (
+        qty,
+        qty_unit,
+        unit_price,
+        price_unit,
+        item_total,
+        ex_gst,
+        gst,
+        inc_gst
+    ) = match.groups()
+
+    return {
+        "Qty.": f"{qty} {qty_unit}",
+        "Qty Value": clean_number(qty),
+        "Qty Unit": qty_unit,
+        "Unit Price": f"{unit_price} {price_unit}",
+        "Unit Price Value": clean_number(unit_price),
+        "Price Unit": price_unit,
+        "Item Total": money(item_total),
+        "Amount excl. GST": money(ex_gst),
+        "GST": money(gst),
+        "Amount Incl. GST": money(inc_gst),
+    }
+
+
+def parse_load_numeric_line(line):
+    """
+    Parse:
+
+        1.000 OT 240.00 253.30 25.33 278.63 AUD
+
+    Structure:
+
+        Qty
+        Qty Unit
+        Unit Price
+        Ex GST
+        GST
+        Inc GST
+        AUD
+    """
+
+    line = clean_line(line)
+
+    line = re.sub(
+        r"\s+A\s*$",
+        "",
+        line,
+        flags=re.IGNORECASE
+    )
+
+    pattern = re.compile(
+        r"^"
+        r"([\d,]+\.\d+)\s+"       # qty
+        r"([A-Za-z]+)\s+"         # qty unit
+        r"([\d,]+\.\d+)\s+"       # unit price
+        r"([\d,]+\.\d+)\s+"       # ex GST
+        r"([\d,]+\.\d+)\s+"       # GST
+        r"([\d,]+\.\d+)"
+        r"(?:\s+AUD)?$",
+        re.IGNORECASE
+    )
+
+    match = pattern.match(line)
+
+    if not match:
+        return None
+
+    (
+        qty,
+        qty_unit,
+        unit_price,
+        ex_gst,
+        gst,
+        inc_gst
+    ) = match.groups()
+
+    return {
+        "Qty.": f"{qty} {qty_unit}",
+        "Qty Value": clean_number(qty),
+        "Qty Unit": qty_unit,
+        "Unit Price": clean_number(unit_price),
+        "Price Unit": "",
+        "Item Total": money(unit_price),
+        "Amount excl. GST": money(ex_gst),
+        "GST": money(gst),
+        "Amount Incl. GST": money(inc_gst),
+    }
+
+
+# ============================================================
+# FUEL LEVY PARSER
+# ============================================================
+
+def parse_fuel_numeric_line(line):
+    """
+    Examples:
+
+        1.635 TO 0.49 BL 2.45
+
+        1.000 FL 1.50 FL 1.50
+
+        1.000 OT 13.30
+
+    Returns the fuel levy amount.
+    """
+
+    line = clean_line(line)
+
+    line = re.sub(
+        r"\s+A\s*$",
+        "",
+        line,
+        flags=re.IGNORECASE
+    )
+
+    # --------------------------------------------------------
+    # Standard form with rate unit:
+    #
+    # 1.635 TO 0.49 BL 2.45
+    # --------------------------------------------------------
+
+    pattern_with_rate_unit = re.compile(
+        r"^"
+        r"([\d,]+\.\d+)\s+"
+        r"([A-Za-z]+)\s+"
+        r"([\d,]+\.\d+)\s+"
+        r"([A-Za-z]+)\s+"
+        r"([\d,]+\.\d+)"
+        r"(?:\s+AUD)?$",
+        re.IGNORECASE
+    )
+
+    match = pattern_with_rate_unit.match(line)
+
+    if match:
+        (
+            qty,
+            qty_unit,
+            rate,
+            rate_unit,
+            amount
+        ) = match.groups()
+
+        return {
+            "Qty.": f"{qty} {qty_unit}",
+            "Qty Value": clean_number(qty),
+            "Qty Unit": qty_unit,
+            "Unit Price": f"{rate} {rate_unit}",
+            "Unit Price Value": clean_number(rate),
+            "Price Unit": rate_unit,
+            "Item Total": money(amount),
+            "Fuel Levy Amount": money(amount)
+        }
+
+    # --------------------------------------------------------
+    # Load style:
+    #
+    # 1.000 OT 13.30
+    # --------------------------------------------------------
+
+    pattern_simple = re.compile(
+        r"^"
+        r"([\d,]+\.\d+)\s+"
+        r"([A-Za-z]+)\s+"
+        r"([\d,]+\.\d+)"
+        r"(?:\s+AUD)?$",
+        re.IGNORECASE
+    )
+
+    match = pattern_simple.match(line)
+
+    if match:
+        qty, qty_unit, amount = match.groups()
+
+        return {
+            "Qty.": f"{qty} {qty_unit}",
+            "Qty Value": clean_number(qty),
+            "Qty Unit": qty_unit,
+            "Unit Price": "",
+            "Unit Price Value": None,
+            "Price Unit": "",
+            "Item Total": money(amount),
+            "Fuel Levy Amount": money(amount)
+        }
+
+    return None
+
+
+# ============================================================
+# MAIN CHARGE HEADER PARSER
+# ============================================================
+
+def parse_charge_header(line):
+    """
+    Parse the first part of an Opal charge.
+
+    Example:
+
+        01.09.2026 Old Corrugated Cartons
+        FFS - Qty/Weight 50001003546705
+
+    Returns:
+        date
+        description
+        charge_type
+        reference
+    """
+
+    date_match = re.match(
+        rf"^({DATE_RE})\s+(.*)$",
+        line
+    )
+
+    if not date_match:
+        return None
+
+    date = date_match.group(1)
+    remainder = date_match.group(2).strip()
+
+    # --------------------------------------------------------
+    # FFS - Qty/Weight
+    # --------------------------------------------------------
+
+    marker = FFS_QTY_RE.search(remainder)
+
+    if marker:
+
+        description = remainder[:marker.start()].strip()
+        after = remainder[marker.end():].strip()
+
+        reference = ""
+
+        if after:
+            # First token is normally the reference.
+            reference = after.split()[0]
+
+        return {
+            "Date": date,
+            "Description": description,
+            "Charge Type": "FFS - Qty/Weight",
+            "Reference": reference,
+            "Header Remainder": after
+        }
+
+    # --------------------------------------------------------
+    # FFS - Load
+    # --------------------------------------------------------
+
+    marker = FFS_LOAD_RE.search(remainder)
+
+    if marker:
+
+        description = remainder[:marker.start()].strip()
+        after = remainder[marker.end():].strip()
+
+        reference = ""
+
+        if after:
+            reference = after.split()[0]
+
+        return {
+            "Date": date,
+            "Description": description,
+            "Charge Type": "FFS - Load",
+            "Reference": reference,
+            "Header Remainder": after
+        }
+
+    # --------------------------------------------------------
+    # Manual Price on same line
+    # --------------------------------------------------------
+
+    marker = MANUAL_RE.search(remainder)
+
+    if marker:
+
+        description = remainder[:marker.start()].strip()
+        after = remainder[marker.end():].strip()
+
+        reference = ""
+
+        if after:
+            # Only use a token as reference when it looks like
+            # an actual reference rather than ordinary text.
+            first_token = after.split()[0]
+
+            if re.match(
+                r"^[A-Za-z0-9][A-Za-z0-9\-/]*$",
+                first_token
+            ):
+                reference = first_token
+
+        return {
+            "Date": date,
+            "Description": description,
+            "Charge Type": "Manual Price",
+            "Reference": reference,
+            "Header Remainder": after
+        }
+
+    return None
+
+
+# ============================================================
+# MULTI-LINE MANUAL PRICE
+# ============================================================
+
+def parse_manual_multiline(lines, start_index):
+    """
+    Handles cases such as:
+
+        18.09.2026 UNDERWEIGHT BINS AUGUST
+        26
+        Manual Price UNDERWEIGHT
+        BINS AUGUST 26
+        11.000 EA 200.00 EA 0.00 2,200.00 220.00 2,420.00 AUD
+
+    """
+
+    first_line = clean_line(lines[start_index])
+
+    date_match = re.match(
+        rf"^({DATE_RE})\s+(.*)$",
+        first_line
+    )
+
+    if not date_match:
+        return None, start_index
+
+    date = date_match.group(1)
+    first_text = date_match.group(2).strip()
+
+    collected = [first_text]
+
+    manual_index = None
+    numeric_index = None
+
+    # Look forward for Manual Price.
+    end = min(
+        len(lines),
+        start_index + 5
+    )
+
+    for j in range(start_index + 1, end):
+
+        candidate = clean_line(lines[j])
+
+        if not candidate:
+            continue
+
+        if MANUAL_RE.search(candidate):
+            manual_index = j
+            collected.append(candidate)
+            break
+
+        # Stop if we hit a new date/charge.
+        if is_date_start(candidate):
+            break
+
+    if manual_index is None:
+        return None, start_index
+
+    # Find numeric line after Manual Price.
+    numeric_index, numeric_line = find_numeric_line(
+        lines,
+        manual_index + 1,
+        max_lookahead=4
+    )
+
+    if numeric_index is None:
+        return None, start_index
+
+    numeric = parse_qty_weight_numeric_line(numeric_line)
+
+    if not numeric:
+        return None, start_index
+
+    # Collect text between date and numeric line.
+    text_parts = []
+
+    for j in range(start_index, numeric_index):
+
+        candidate = clean_line(lines[j])
+
+        if not candidate:
+            continue
+
+        # Don't include standalone A.
+        if candidate.upper() == "A":
+            continue
+
+        # Don't include numeric line.
+        if j == numeric_index:
+            continue
+
+        text_parts.append(candidate)
+
+    # Remove date from first element.
+    if text_parts:
+
+        first = text_parts[0]
+
+        first = re.sub(
+            rf"^{DATE_RE}\s*",
+            "",
+            first
+        )
+
+        text_parts[0] = first.strip()
+
+    # Remove "Manual Price" marker from description.
+    description_parts = []
+
+    for part in text_parts:
+
+        cleaned = MANUAL_RE.sub(
+            "",
+            part,
+            count=1
+        ).strip()
+
+        if cleaned:
+            description_parts.append(cleaned)
+
+    description = " ".join(description_parts)
+
+    # Try to identify a useful reference.
+    reference = ""
+
+    # Search the text for something resembling a reference.
+    for part in description_parts:
+
+        # Skip ordinary long words.
+        tokens = part.split()
+
+        for token in tokens:
+
+            if re.fullmatch(
+                r"[A-Z0-9][A-Z0-9\-/]{3,}",
+                token,
+                re.IGNORECASE
+            ):
+                # Don't treat normal words as reference.
+                if token.upper() not in {
+                    "UNDERWEIGHT",
+                    "BINS",
+                    "AUGUST",
+                    "PRICE"
+                }:
+                    reference = token
+                    break
+
+        if reference:
+            break
+
+    billed = get_billed_qty(
+        lines,
+        numeric_index + 1,
+        lookahead=3
+    )
+
+    row = {
+        "Date": date,
+        "Description": description,
+        "Charge Type": "Manual Price",
+        "Reference": reference,
+        "Billed qty": billed["Billed qty"],
+        **numeric,
+    }
+
+    return row, numeric_index
+
+
+# ============================================================
+# INVOICE PROCESSOR
 # ============================================================
 
 def process_pdf(file_stream):
 
-    data = []
-    missed_lines = []
+    extracted_rows = []
+    unmatched_lines = []
 
-    invoice_summaries = []
+    customer_totals = []
+    subtotal_records = []
+    invoice_totals = []
 
     current_invoice = ""
     current_invoice_date = ""
@@ -310,922 +879,971 @@ def process_pdf(file_stream):
     current_customer_code = ""
     current_customer_name = ""
 
-    current_date = ""
-
-    full_text = ""
-
-    # --------------------------------------------------------
-    # State used for validation
-    # --------------------------------------------------------
-
-    invoice_total_payable = defaultdict(
-        lambda: {
-            "ex_gst": 0.0,
-            "gst": 0.0,
-            "inc_gst": 0.0
-        }
-    )
-
-    customer_totals = {}
+    full_text_pages = []
 
     with pdfplumber.open(file_stream) as pdf:
 
-        for page_num, page in enumerate(pdf.pages, start=1):
+        for page_num, page in enumerate(
+            pdf.pages,
+            start=1
+        ):
 
-            text = page.extract_text() or ""
+            page_text = page.extract_text()
 
-            full_text += text + "\n"
-
-            if not text:
+            if not page_text:
                 continue
 
-            raw_lines = text.split("\n")
+            full_text_pages.append(page_text)
 
-            # Clean lines
+            raw_lines = page_text.splitlines()
+
             lines = [
-                normalise_line(x)
+                clean_line(x)
                 for x in raw_lines
             ]
+
+            # ------------------------------------------------
+            # Find invoice header on this page.
+            # ------------------------------------------------
+
+            page_invoice_match = INVOICE_RE.search(
+                page_text
+            )
+
+            if page_invoice_match:
+                current_invoice = page_invoice_match.group(1)
+
+            page_date_match = INVOICE_DATE_RE.search(
+                page_text
+            )
+
+            if page_date_match:
+                current_invoice_date = page_date_match.group(1)
+
+            # ------------------------------------------------
+            # Page line parser
+            # ------------------------------------------------
 
             i = 0
 
             while i < len(lines):
 
-                line = lines[i]
+                line = clean_line(lines[i])
 
                 if not line:
                     i += 1
                     continue
 
-                # ====================================================
-                # INVOICE NUMBER
-                # ====================================================
+                # ============================================
+                # Invoice number
+                # ============================================
 
-                invoice_number = extract_invoice_number(line)
+                invoice_match = INVOICE_RE.search(line)
 
-                if invoice_number:
-
-                    if invoice_number != current_invoice:
-
-                        current_invoice = invoice_number
-
-                        # Look for invoice date on this page
-                        for header_line in lines[:25]:
-
-                            date_match = re.search(
-                                rf"\b({DATE_RE})\b",
-                                header_line
-                            )
-
-                            if date_match:
-
-                                current_invoice_date = date_match.group(1)
-                                break
-
-                        # Reset customer when new invoice starts
-                        current_customer_code = ""
-                        current_customer_name = ""
-
+                if invoice_match:
+                    current_invoice = invoice_match.group(1)
                     i += 1
                     continue
 
-                # ====================================================
-                # CUSTOMER / SITE
-                # ====================================================
+                # ============================================
+                # Customer total
+                # ============================================
 
-                customer_match = CUSTOMER_RE.match(line)
+                customer_total_match = CUSTOMER_TOTAL_RE.match(
+                    line
+                )
 
-                if customer_match:
+                if customer_total_match:
 
-                    current_customer_code = customer_match.group(1)
+                    (
+                        customer_code,
+                        customer_name,
+                        ex_gst,
+                        gst,
+                        inc_gst
+                    ) = customer_total_match.groups()
 
-                    current_customer_name = (
-                        customer_match.group(2).strip()
-                    )
-
-                    i += 1
-                    continue
-
-                # ====================================================
-                # CUSTOMER NAME CONTINUATION
-                # ====================================================
-
-                # Some customer names wrap over multiple PDF lines.
-                if (
-                    current_customer_code
-                    and not is_date_line(line)
-                    and not looks_like_charge(line)
-                    and not is_structural_line(line)
-                    and not line.startswith("Billed Qty")
-                    and not line.startswith("OPR Fuel")
-                ):
-
-                    # Only append obvious customer continuation text.
-                    if (
-                        len(line) < 80
-                        and not re.search(r"\d+\.\d+", line)
-                    ):
-
-                        current_customer_name += " " + line
-
-                        i += 1
-                        continue
-
-                # ====================================================
-                # DATE
-                # ====================================================
-
-                if is_date_line(line):
-
-                    current_date = extract_date(line)
-
-                # ====================================================
-                # FUEL LEVY
-                # ====================================================
-
-                fuel = parse_fuel_levy_line(line)
-
-                if fuel:
-
-                    billed = extract_billed_qty(
-                        lines,
-                        i
-                    )
-
-                    data.append({
-
+                    customer_totals.append({
                         "Invoice No.": current_invoice,
-
-                        "Invoice Date": current_invoice_date,
-
-                        "Customer Code": current_customer_code,
-
-                        "Customer": current_customer_name,
-
-                        "Date": current_date,
-
-                        "Description": fuel["description"],
-
-                        "Charge Type": (
-                            "Fuel Levy - Qty/Weight"
-                            if "Qty/Wt" in fuel["description"]
-                            else "Fuel Levy - Load"
-                        ),
-
-                        "Reference": fuel["reference"],
-
-                        "Qty": fuel["qty"],
-
-                        "Qty Unit": fuel["qty_unit"],
-
-                        "Unit Price": fuel["rate"],
-
-                        "Price Unit": fuel.get("rate_unit") or "",
-
-                        "Item Total": "",
-
-                        "Amount Ex GST": fuel["amount"],
-
-                        "GST": "",
-
-                        "Amount Inc GST": "",
-
-                        "Billed Qty": billed["billed_qty"],
-
-                        "Billed Qty Unit": billed["billed_qty_unit"],
-
-                        "Is Fuel Levy": True,
-
-                        "Page": page_num,
-
-                        "Parse Status": "Parsed"
-
+                        "Customer Code": customer_code,
+                        "Customer": customer_name.strip(),
+                        "Amount excl. GST": money(ex_gst),
+                        "GST": money(gst),
+                        "Amount Incl. GST": money(inc_gst),
+                        "Source": "Customer Total"
                     })
 
                     i += 1
                     continue
 
-                # ====================================================
-                # MAIN CHARGE LINE
-                # ====================================================
+                # ============================================
+                # Customer header
+                # ============================================
 
-                if looks_like_charge(line):
+                if is_customer_line(line):
 
-                    charge_line = line
+                    code, name = parse_customer_line(line)
 
-                    # ------------------------------------------------
-                    # If line has date, update date
-                    # ------------------------------------------------
+                    if code and name:
 
-                    if is_date_line(charge_line):
+                        current_customer_code = code
+                        current_customer_name = name
 
-                        current_date = extract_date(charge_line)
+                    i += 1
+                    continue
 
-                    # ------------------------------------------------
-                    # Gather continuation lines
-                    # ------------------------------------------------
-
-                    block_lines = [charge_line]
-
-                    lookahead = 1
-
-                    while (
-                        i + lookahead < len(lines)
-                        and lookahead <= 5
-                    ):
-
-                        next_line = lines[i + lookahead]
-
-                        if not next_line:
-                            break
-
-                        if is_date_line(next_line):
-                            break
-
-                        if looks_like_customer(next_line):
-                            break
-
-                        if is_structural_line(next_line):
-                            break
-
-                        if (
-                            "Billed Qty" in next_line
-                            or "AUD" in next_line
-                            or re.search(
-                                rf"{NUMBER_RE}\s+{NUMBER_RE}\s+{NUMBER_RE}",
-                                next_line
-                            )
-                        ):
-
-                            block_lines.append(next_line)
-
-                        else:
-
-                            # Useful for multi-line descriptions
-                            block_lines.append(next_line)
-
-                        # Stop once we have the AUD line
-                        if "AUD" in next_line:
-
-                            break
-
-                        lookahead += 1
-
-                    full_block = " ".join(block_lines)
-
-                    full_block = normalise_line(full_block)
-
-                    # ------------------------------------------------
-                    # Determine charge type
-                    # ------------------------------------------------
-
-                    if "FFS - Qty/Weight" in full_block:
-
-                        charge_type = "FFS - Qty/Weight"
-
-                    elif "FFS - Load" in full_block:
-
-                        charge_type = "FFS - Load"
-
-                    elif "Manual Price" in full_block:
-
-                        charge_type = "Manual Price"
-
-                    else:
-
-                        charge_type = "Other"
-
-                    # ------------------------------------------------
-                    # Parse monetary/quantity tail
-                    # ------------------------------------------------
-
-                    parsed = parse_money_tail(full_block)
-
-                    if parsed:
-
-                        # --------------------------------------------
-                        # Remove date
-                        # --------------------------------------------
-
-                        description_part = remove_date(full_block)
-
-                        # --------------------------------------------
-                        # Remove numeric tail
-                        # --------------------------------------------
-
-                        numeric_match = re.search(
-                            rf"{NUMBER_RE}\s+[A-Za-z]+\s+"
-                            rf"{NUMBER_RE}.*AUD$",
-                            description_part,
-                            re.IGNORECASE
-                        )
-
-                        if numeric_match:
-
-                            description_part = (
-                                description_part[
-                                    :numeric_match.start()
-                                ].strip()
-                            )
-
-                        # --------------------------------------------
-                        # Extract charge type and reference
-                        # --------------------------------------------
-
-                        reference = ""
-
-                        if charge_type in (
-                            "FFS - Qty/Weight",
-                            "FFS - Load"
-                        ):
-
-                            marker = charge_type
-
-                            if marker in description_part:
-
-                                before, after = (
-                                    description_part.split(
-                                        marker,
-                                        1
-                                    )
-                                )
-
-                                description = before.strip()
-
-                                after = after.strip()
-
-                                # Reference is first token
-                                # after charge type.
-                                ref_match = re.match(
-                                    r"^(\S+)",
-                                    after
-                                )
-
-                                if ref_match:
-
-                                    reference = (
-                                        ref_match.group(1)
-                                    )
-
-                        elif charge_type == "Manual Price":
-
-                            before, after = (
-                                description_part.split(
-                                    "Manual Price",
-                                    1
-                                )
-                            )
-
-                            description = before.strip()
-
-                            # Everything after Manual Price may
-                            # contain reference / description.
-                            reference_match = re.match(
-                                r"^(\S+)",
-                                after.strip()
-                            )
-
-                            if reference_match:
-
-                                reference = (
-                                    reference_match.group(1)
-                                )
-
-                        else:
-
-                            description = description_part.strip()
-
-                        # ------------------------------------------------
-                        # Billed Qty
-                        # ------------------------------------------------
-
-                        billed = extract_billed_qty(
-                            lines,
-                            i + lookahead
-                            if i + lookahead < len(lines)
-                            else i
-                        )
-
-                        # Also search from current line
-                        if not billed["billed_qty"]:
-
-                            billed = extract_billed_qty(
-                                lines,
-                                i
-                            )
-
-                        # ------------------------------------------------
-                        # Create record
-                        # ------------------------------------------------
-
-                        record = {
-
-                            "Invoice No.": current_invoice,
-
-                            "Invoice Date": current_invoice_date,
-
-                            "Customer Code": current_customer_code,
-
-                            "Customer": current_customer_name,
-
-                            "Date": current_date,
-
-                            "Description": description,
-
-                            "Charge Type": charge_type,
-
-                            "Reference": reference,
-
-                            "Qty": parsed["qty"],
-
-                            "Qty Unit": parsed["qty_unit"],
-
-                            "Unit Price": parsed["unit_price"],
-
-                            "Price Unit": parsed.get(
-                                "price_unit",
-                                ""
-                            ),
-
-                            "Item Total": parsed.get(
-                                "item_total",
-                                ""
-                            ),
-
-                            "Amount Ex GST": parsed["ex_gst"],
-
-                            "GST": parsed["gst"],
-
-                            "Amount Inc GST": parsed["inc_gst"],
-
-                            "Billed Qty": billed[
-                                "billed_qty"
-                            ],
-
-                            "Billed Qty Unit": billed[
-                                "billed_qty_unit"
-                            ],
-
-                            "Is Fuel Levy": False,
-
-                            "Page": page_num,
-
-                            "Parse Status": "Parsed"
-
-                        }
-
-                        data.append(record)
-
-                        i += max(
-                            1,
-                            lookahead
-                        )
-
-                        continue
-
-                    else:
-
-                        missed_lines.append({
-
-                            "Invoice No.": current_invoice,
-
-                            "Page": page_num,
-
-                            "Line No.": i + 1,
-
-                            "Customer Code":
-                                current_customer_code,
-
-                            "Customer":
-                                current_customer_name,
-
-                            "Line": full_block,
-
-                            "Reason":
-                                "Charge detected but numeric pattern not recognised"
-
-                        })
-
-                        i += 1
-                        continue
-
-                # ====================================================
-                # SUBTOTAL
-                # ====================================================
+                # ============================================
+                # SUB-TOTAL
+                # ============================================
 
                 subtotal_match = SUBTOTAL_RE.search(line)
 
                 if subtotal_match:
 
-                    customer_totals_key = (
-                        current_invoice,
-                        current_customer_code
-                    )
+                    (
+                        charge_code,
+                        qty,
+                        qty_unit,
+                        ex_gst,
+                        gst,
+                        inc_gst
+                    ) = subtotal_match.groups()
 
-                    customer_totals[
-                        customer_totals_key
-                    ] = {
-
-                        "invoice_no":
-                            current_invoice,
-
-                        "customer_code":
-                            current_customer_code,
-
-                        "customer":
-                            current_customer_name,
-
-                        "ex_gst":
-                            clean_number(
-                                subtotal_match.group(2)
-                            ),
-
-                        "gst":
-                            clean_number(
-                                subtotal_match.group(3)
-                            ),
-
-                        "inc_gst":
-                            clean_number(
-                                subtotal_match.group(4)
-                            ),
-
-                        "source":
-                            "SUB-TOTAL",
-
-                        "page":
-                            page_num
-                    }
+                    subtotal_records.append({
+                        "Invoice No.": current_invoice,
+                        "Customer Code": current_customer_code,
+                        "Customer": current_customer_name,
+                        "Charge Code": charge_code,
+                        "Qty": f"{qty} {qty_unit}",
+                        "Amount excl. GST": money(ex_gst),
+                        "GST": money(gst),
+                        "Amount Incl. GST": money(inc_gst),
+                    })
 
                     i += 1
                     continue
 
-                # ====================================================
-                # CUSTOMER TOTAL
-                # ====================================================
-
-                customer_total_match = (
-                    CUSTOMER_TOTAL_RE.match(line)
-                )
-
-                if customer_total_match:
-
-                    customer_totals_key = (
-                        current_invoice,
-                        customer_total_match.group(1)
-                    )
-
-                    customer_totals[
-                        customer_totals_key
-                    ] = {
-
-                        "invoice_no":
-                            current_invoice,
-
-                        "customer_code":
-                            customer_total_match.group(1),
-
-                        "customer":
-                            current_customer_name,
-
-                        "ex_gst":
-                            clean_number(
-                                customer_total_match.group(2)
-                            ),
-
-                        "gst":
-                            clean_number(
-                                customer_total_match.group(3)
-                            ),
-
-                        "inc_gst":
-                            clean_number(
-                                customer_total_match.group(4)
-                            ),
-
-                        "source":
-                            "CUSTOMER TOTAL",
-
-                        "page":
-                            page_num
-                    }
-
-                    i += 1
-                    continue
-
-                # ====================================================
+                # ============================================
                 # TOTAL PAYABLE
-                # ====================================================
+                # ============================================
 
                 total_match = TOTAL_PAYABLE_RE.search(line)
 
                 if total_match:
 
-                    invoice_total_payable[
-                        current_invoice
-                    ] = {
+                    (
+                        ex_gst,
+                        gst,
+                        inc_gst
+                    ) = total_match.groups()
 
-                        "ex_gst":
-                            clean_number(
-                                total_match.group(1)
-                            ),
-
-                        "gst":
-                            clean_number(
-                                total_match.group(2)
-                            ),
-
-                        "inc_gst":
-                            clean_number(
-                                total_match.group(3)
-                            ),
-
-                        "page":
-                            page_num
-                    }
+                    invoice_totals.append({
+                        "Invoice No.": current_invoice,
+                        "Amount excl. GST": money(ex_gst),
+                        "GST": money(gst),
+                        "Amount Incl. GST": money(inc_gst),
+                    })
 
                     i += 1
                     continue
 
-                # ====================================================
-                # OTHERWISE IGNORE HEADER / FOOTER
-                # ====================================================
+                # ============================================
+                # FUEL LEVY
+                # ============================================
 
-                ignored_patterns = [
-                    "Opal Packaging Australia",
-                    "ABN ",
-                    "Tax Invoice",
-                    "Payment Terms",
-                    "AMOUNT DUE",
-                    "Invoice to:",
-                    "Biller Code",
-                    "Telephone & Internet Banking",
-                    "Please remit",
-                    "Account Enquiries",
-                    "Customer Service",
-                    "NSW:",
-                    "VIC:",
-                    "QLD:",
-                    "SA/WA:",
-                    "Page "
-                ]
+                if FUEL_RE.match(line):
 
-                if any(
-                    x.lower() in line.lower()
-                    for x in ignored_patterns
-                ):
+                    fuel_type = (
+                        "Fuel Levy - Load"
+                        if "LOAD" in line.upper()
+                        else "Fuel Levy - Qty/Weight"
+                    )
 
-                    i += 1
-                    continue
+                    # Reference normally follows fuel levy.
+                    after = re.sub(
+                        r"^OPR\s+Fuel\s+Levy-[^ ]+\s*",
+                        "",
+                        line,
+                        flags=re.IGNORECASE
+                    )
 
-                # ====================================================
-                # POTENTIAL MISSED DATA
-                # ====================================================
+                    # More reliable extraction of reference:
+                    fuel_reference = ""
+
+                    parts = line.split()
+
+                    # Find token after Qty/Wt or Load.
+                    for idx, token in enumerate(parts):
+
+                        if token.lower() in {
+                            "qty/wt",
+                            "load"
+                        }:
+
+                            if idx + 1 < len(parts):
+                                fuel_reference = parts[idx + 1]
+
+                            break
+
+                    # Numeric line may be next line because of
+                    # PDF line wrapping.
+                    numeric_index = i
+                    numeric_line = None
+
+                    # Check whether numbers are already on line.
+                    after_marker_match = re.search(
+                        r"(?:Qty/Wt|Load)\s+.+?\s+"
+                        r"([\d,]+\.\d+)",
+                        line,
+                        re.IGNORECASE
+                    )
+
+                    if after_marker_match:
+                        numeric_line = line[
+                            after_marker_match.start():
+                        ]
+
+                    else:
+                        numeric_index, numeric_line = find_numeric_line(
+                            lines,
+                            i + 1,
+                            max_lookahead=3
+                        )
+
+                    fuel_numeric = None
+
+                    if numeric_line:
+
+                        if numeric_line == line:
+                            # Remove text before first numeric sequence.
+                            first_number = re.search(
+                                r"\d[\d,]*\.\d+",
+                                numeric_line
+                            )
+
+                            if first_number:
+                                numeric_line_for_parse = (
+                                    numeric_line[first_number.start():]
+                                )
+                            else:
+                                numeric_line_for_parse = numeric_line
+                        else:
+                            numeric_line_for_parse = numeric_line
+
+                        fuel_numeric = parse_fuel_numeric_line(
+                            numeric_line_for_parse
+                        )
+
+                    if fuel_numeric:
+
+                        billed = get_billed_qty(
+                            lines,
+                            (
+                                numeric_index + 1
+                                if numeric_index is not None
+                                else i + 1
+                            ),
+                            lookahead=3
+                        )
+
+                        row = {
+                            "Invoice No.": current_invoice,
+                            "Customer Code": current_customer_code,
+                            "Customer": current_customer_name,
+                            "Date": "",
+                            "Description": "OPR Fuel Levy",
+                            "Charge Type": fuel_type,
+                            "Reference": fuel_reference,
+                            "Billed qty": billed["Billed qty"],
+                            "Qty.": fuel_numeric["Qty."],
+                            "Qty Value": fuel_numeric["Qty Value"],
+                            "Qty Unit": fuel_numeric["Qty Unit"],
+                            "Unit Price": fuel_numeric["Unit Price"],
+                            "Unit Price Value": fuel_numeric[
+                                "Unit Price Value"
+                            ],
+                            "Price Unit": fuel_numeric["Price Unit"],
+                            "Item Total": fuel_numeric["Item Total"],
+                            "Amount excl. GST": None,
+                            "GST": None,
+                            "Amount Incl. GST": None,
+                            "Fuel Levy Amount": fuel_numeric[
+                                "Fuel Levy Amount"
+                            ],
+                            "Is Fuel Levy": True,
+                            "Source Page": page_num,
+                        }
+
+                        extracted_rows.append(row)
+
+                        if numeric_index is not None and numeric_index > i:
+                            i = numeric_index + 1
+                        else:
+                            i += 1
+
+                        continue
+
+                # ============================================
+                # MAIN CHARGE
+                # ============================================
+
+                if is_date_start(line):
+
+                    charge_header = parse_charge_header(line)
+
+                    if charge_header:
+
+                        numeric_index, numeric_line = find_numeric_line(
+                            lines,
+                            i + 1,
+                            max_lookahead=5
+                        )
+
+                        if numeric_index is not None:
+
+                            if (
+                                charge_header["Charge Type"]
+                                == "FFS - Load"
+                            ):
+                                numeric = parse_load_numeric_line(
+                                    numeric_line
+                                )
+                            else:
+                                numeric = parse_qty_weight_numeric_line(
+                                    numeric_line
+                                )
+
+                            if numeric:
+
+                                billed = get_billed_qty(
+                                    lines,
+                                    numeric_index + 1,
+                                    lookahead=3
+                                )
+
+                                row = {
+                                    "Invoice No.": current_invoice,
+                                    "Customer Code": current_customer_code,
+                                    "Customer": current_customer_name,
+                                    "Date": charge_header["Date"],
+                                    "Description": charge_header[
+                                        "Description"
+                                    ],
+                                    "Charge Type": charge_header[
+                                        "Charge Type"
+                                    ],
+                                    "Reference": charge_header[
+                                        "Reference"
+                                    ],
+                                    "Billed qty": billed[
+                                        "Billed qty"
+                                    ],
+                                    **numeric,
+                                    "Fuel Levy Amount": None,
+                                    "Is Fuel Levy": False,
+                                    "Source Page": page_num,
+                                }
+
+                                extracted_rows.append(row)
+
+                                i = numeric_index + 1
+                                continue
+
+                        # ------------------------------------------------
+                        # If standard charge failed, mark for review.
+                        # ------------------------------------------------
+
+                        unmatched_lines.append({
+                            "Page": page_num,
+                            "Line No.": i + 1,
+                            "Invoice No.": current_invoice,
+                            "Customer Code": current_customer_code,
+                            "Customer": current_customer_name,
+                            "Line": line,
+                            "Reason": (
+                                "Charge detected but numeric "
+                                "detail line could not be parsed"
+                            )
+                        })
+
+                        i += 1
+                        continue
+
+                    # ------------------------------------------------
+                    # Multi-line Manual Price
+                    # ------------------------------------------------
+
+                    if i + 1 < len(lines):
+
+                        manual_row, manual_end = (
+                            parse_manual_multiline(
+                                lines,
+                                i
+                            )
+                        )
+
+                        if manual_row:
+
+                            row = {
+                                "Invoice No.": current_invoice,
+                                "Customer Code": current_customer_code,
+                                "Customer": current_customer_name,
+                                **manual_row,
+                                "Fuel Levy Amount": None,
+                                "Is Fuel Levy": False,
+                                "Source Page": page_num,
+                            }
+
+                            extracted_rows.append(row)
+
+                            i = manual_end + 1
+                            continue
+
+                # ============================================
+                # Standalone Manual Price line
+                # ============================================
+
+                if MANUAL_RE.search(line):
+
+                    numeric_index, numeric_line = find_numeric_line(
+                        lines,
+                        i + 1,
+                        max_lookahead=4
+                    )
+
+                    if numeric_index is not None:
+
+                        numeric = parse_qty_weight_numeric_line(
+                            numeric_line
+                        )
+
+                        if numeric:
+
+                            description = MANUAL_RE.sub(
+                                "",
+                                line
+                            ).strip()
+
+                            billed = get_billed_qty(
+                                lines,
+                                numeric_index + 1,
+                                lookahead=3
+                            )
+
+                            extracted_rows.append({
+                                "Invoice No.": current_invoice,
+                                "Customer Code": current_customer_code,
+                                "Customer": current_customer_name,
+                                "Date": "",
+                                "Description": description,
+                                "Charge Type": "Manual Price",
+                                "Reference": "",
+                                "Billed qty": billed[
+                                    "Billed qty"
+                                ],
+                                **numeric,
+                                "Fuel Levy Amount": None,
+                                "Is Fuel Levy": False,
+                                "Source Page": page_num,
+                            })
+
+                            i = numeric_index + 1
+                            continue
+
+                # ============================================
+                # Potential unmatched invoice lines
+                # ============================================
 
                 if (
-                    re.search(r"\d+\.\d+", line)
+                    DATE_RE
                     and (
-                        "AUD" in line
-                        or "FFS" in line
-                        or "Manual" in line
+                        "AUD" in line.upper()
+                        or FFS_QTY_RE.search(line)
+                        or FFS_LOAD_RE.search(line)
+                        or MANUAL_RE.search(line)
                     )
                 ):
 
-                    missed_lines.append({
-
-                        "Invoice No.": current_invoice,
-
+                    unmatched_lines.append({
                         "Page": page_num,
-
                         "Line No.": i + 1,
-
-                        "Customer Code":
-                            current_customer_code,
-
-                        "Customer":
-                            current_customer_name,
-
+                        "Invoice No.": current_invoice,
+                        "Customer Code": current_customer_code,
+                        "Customer": current_customer_name,
                         "Line": line,
-
-                        "Reason":
-                            "Potential invoice data not parsed"
-
+                        "Reason": "Potential invoice line not parsed"
                     })
 
                 i += 1
 
-    # ============================================================
-    # DATAFRAME
-    # ============================================================
+    # ========================================================
+    # BUILD DATAFRAMES
+    # ========================================================
 
-    df = pd.DataFrame(data)
+    invoice_df = pd.DataFrame(extracted_rows)
 
-    if not df.empty:
-
-        # Convert numeric columns
-        numeric_columns = [
-            "Qty",
-            "Unit Price",
-            "Item Total",
-            "Amount Ex GST",
-            "GST",
-            "Amount Inc GST",
-            "Billed Qty"
-        ]
-
-        for column in numeric_columns:
-
-            if column in df.columns:
-
-                df[column] = pd.to_numeric(
-                    df[column],
-                    errors="coerce"
-                )
-
-        # --------------------------------------------------------
-        # IMPORTANT:
-        # Fuel levy is already included in the main charge's
-        # Amount Ex GST on the Opal invoice.
-        #
-        # Therefore do NOT add fuel levy rows again when
-        # validating invoice totals.
-        # --------------------------------------------------------
-
-        df["Validation Ex GST"] = df.apply(
-
-            lambda row:
-                0.0
-                if row["Is Fuel Levy"]
-                else (
-                    row["Amount Ex GST"]
-                    if pd.notna(row["Amount Ex GST"])
-                    else 0.0
-                ),
-
-            axis=1
+    if invoice_df.empty:
+        invoice_df = pd.DataFrame(
+            columns=[
+                "Invoice No.",
+                "Customer Code",
+                "Customer",
+                "Date",
+                "Description",
+                "Charge Type",
+                "Reference",
+                "Billed qty",
+                "Qty.",
+                "Qty Value",
+                "Qty Unit",
+                "Unit Price",
+                "Unit Price Value",
+                "Price Unit",
+                "Item Total",
+                "Amount excl. GST",
+                "GST",
+                "Amount Incl. GST",
+                "Fuel Levy Amount",
+                "Is Fuel Levy",
+                "Source Page",
+            ]
         )
 
-        df["Validation GST"] = df.apply(
+    validation_df = build_validation(
+        invoice_df,
+        invoice_totals
+    )
 
-            lambda row:
-                0.0
-                if row["Is Fuel Levy"]
-                else (
-                    row["GST"]
-                    if pd.notna(row["GST"])
-                    else 0.0
-                ),
+    customer_totals_df = build_customer_totals(
+        invoice_df,
+        customer_totals,
+        subtotal_records
+    )
 
-            axis=1
-        )
-
-        df["Validation Inc GST"] = df.apply(
-
-            lambda row:
-                0.0
-                if row["Is Fuel Levy"]
-                else (
-                    row["Amount Inc GST"]
-                    if pd.notna(row["Amount Inc GST"])
-                    else 0.0
-                ),
-
-            axis=1
-        )
-
-    # ============================================================
-    # VALIDATION
-    # ============================================================
-
-    validation_rows = []
-
-    if not df.empty:
-
-        for invoice_no, invoice_group in df.groupby(
-            "Invoice No."
-        ):
-
-            extracted_ex = round(
-                invoice_group[
-                    "Validation Ex GST"
-                ].sum(),
-                2
-            )
-
-            extracted_gst = round(
-                invoice_group[
-                    "Validation GST"
-                ].sum(),
-                2
-            )
-
-            extracted_inc = round(
-                invoice_group[
-                    "Validation Inc GST"
-                ].sum(),
-                2
-            )
-
-            expected = invoice_total_payable.get(
-                invoice_no,
-                {}
-            )
-
-            expected_ex = expected.get(
-                "ex_gst"
-            )
-
-            expected_gst = expected.get(
-                "gst"
-            )
-
-            expected_inc = expected.get(
-                "inc_gst"
-            )
-
-            ex_difference = (
-                round(
-                    extracted_ex - expected_ex,
-                    2
-                )
-                if expected_ex is not None
-                else None
-            )
-
-            gst_difference = (
-                round(
-                    extracted_gst - expected_gst,
-                    2
-                )
-                if expected_gst is not None
-                else None
-            )
-
-            inc_difference = (
-                round(
-                    extracted_inc - expected_inc,
-                    2
-                )
-                if expected_inc is not None
-                else None
-            )
-
-            passed = (
-                expected_ex is not None
-                and expected_gst is not None
-                and expected_inc is not None
-                and abs(ex_difference) <= 0.02
-                and abs(gst_difference) <= 0.02
-                and abs(inc_difference) <= 0.02
-            )
-
-            validation_rows.append({
-
-                "Invoice No.": invoice_no,
-
-                "Extracted Ex GST":
-                    extracted_ex,
-
-                "Invoice Ex GST":
-                    expected_ex,
-
-                "Ex GST Difference":
-                    ex_difference,
-
-                "Extracted GST":
-                    extracted_gst,
-
-                "Invoice GST":
-                    expected_gst,
-
-                "GST Difference":
-                    gst_difference,
-
-                "Extracted Inc GST":
-                    extracted_inc,
-
-                "Invoice Inc GST":
-                    expected_inc,
-
-                "Inc GST Difference":
-                    inc_difference,
-
-                "Validation":
-                    "PASS" if passed else "FAIL"
-
-            })
-
-    validation_df = pd.DataFrame(
-        validation_rows
+    unmatched_df = pd.DataFrame(
+        unmatched_lines
     )
 
     return (
-        df,
-        pd.DataFrame(missed_lines),
+        invoice_df,
         validation_df,
-        invoice_total_payable,
-        customer_totals
+        customer_totals_df,
+        unmatched_df
     )
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def build_validation(
+    invoice_df,
+    printed_invoice_totals
+):
+
+    if invoice_df.empty:
+        extracted = pd.DataFrame(
+            columns=[
+                "Invoice No.",
+                "Extracted Ex GST",
+                "Extracted GST",
+                "Extracted Inc GST"
+            ]
+        )
+    else:
+
+        # IMPORTANT:
+        #
+        # Fuel levy rows are excluded because Opal has already
+        # included the fuel levy inside the main charge's
+        # Ex GST / GST / Inc GST values.
+        #
+        # Example:
+        #
+        # Main charge:
+        #   Item Total = 45.05
+        #   Ex GST     = 47.50
+        #
+        # Fuel levy:
+        #   2.45
+        #
+        # 45.05 + 2.45 = 47.50
+        #
+        # Therefore adding fuel levy again would double count it.
+
+        main_rows = invoice_df[
+            invoice_df["Is Fuel Levy"] != True
+        ].copy()
+
+        extracted = (
+            main_rows
+            .groupby("Invoice No.", dropna=False)
+            .agg(
+                **{
+                    "Extracted Ex GST": (
+                        "Amount excl. GST",
+                        "sum"
+                    ),
+                    "Extracted GST": (
+                        "GST",
+                        "sum"
+                    ),
+                    "Extracted Inc GST": (
+                        "Amount Incl. GST",
+                        "sum"
+                    ),
+                    "Main Charge Lines": (
+                        "Description",
+                        "count"
+                    )
+                }
+            )
+            .reset_index()
+        )
+
+    printed_df = pd.DataFrame(
+        printed_invoice_totals
+    )
+
+    if printed_df.empty:
+
+        result = extracted.copy()
+
+        if not result.empty:
+
+            result["Invoice Ex GST"] = None
+            result["Invoice GST"] = None
+            result["Invoice Inc GST"] = None
+            result["Difference Ex GST"] = None
+            result["Difference GST"] = None
+            result["Difference Inc GST"] = None
+            result["Validation"] = "No printed total found"
+
+        return result
+
+    printed_df = (
+        printed_df
+        .drop_duplicates(
+            subset=["Invoice No."]
+        )
+    )
+
+    result = pd.merge(
+        extracted,
+        printed_df,
+        on="Invoice No.",
+        how="outer"
+    )
+
+    result["Difference Ex GST"] = (
+        result["Extracted Ex GST"].fillna(0)
+        - result["Amount excl. GST"].fillna(0)
+    ).round(2)
+
+    result["Difference GST"] = (
+        result["Extracted GST"].fillna(0)
+        - result["GST"].fillna(0)
+    ).round(2)
+
+    result["Difference Inc GST"] = (
+        result["Extracted Inc GST"].fillna(0)
+        - result["Amount Incl. GST"].fillna(0)
+    ).round(2)
+
+    tolerance = 0.02
+
+    result["Validation"] = result.apply(
+        lambda row: (
+            "PASS"
+            if (
+                abs(row["Difference Ex GST"]) <= tolerance
+                and abs(row["Difference GST"]) <= tolerance
+                and abs(row["Difference Inc GST"]) <= tolerance
+            )
+            else "FAIL"
+        ),
+        axis=1
+    )
+
+    result = result.rename(
+        columns={
+            "Amount excl. GST": "Invoice Ex GST",
+            "GST": "Invoice GST",
+            "Amount Incl. GST": "Invoice Inc GST"
+        }
+    )
+
+    return result
+
+
+# ============================================================
+# CUSTOMER / SITE VALIDATION
+# ============================================================
+
+def build_customer_totals(
+    invoice_df,
+    printed_customer_totals,
+    subtotal_records
+):
+
+    if invoice_df.empty:
+        extracted = pd.DataFrame()
+    else:
+
+        main_rows = invoice_df[
+            invoice_df["Is Fuel Levy"] != True
+        ].copy()
+
+        extracted = (
+            main_rows
+            .groupby(
+                [
+                    "Invoice No.",
+                    "Customer Code",
+                    "Customer"
+                ],
+                dropna=False
+            )
+            .agg(
+                **{
+                    "Extracted Ex GST": (
+                        "Amount excl. GST",
+                        "sum"
+                    ),
+                    "Extracted GST": (
+                        "GST",
+                        "sum"
+                    ),
+                    "Extracted Inc GST": (
+                        "Amount Incl. GST",
+                        "sum"
+                    ),
+                    "Main Charge Lines": (
+                        "Description",
+                        "count"
+                    )
+                }
+            )
+            .reset_index()
+        )
+
+    printed = pd.DataFrame(
+        printed_customer_totals
+    )
+
+    if not printed.empty:
+
+        printed = (
+            printed
+            .drop_duplicates(
+                subset=[
+                    "Invoice No.",
+                    "Customer Code"
+                ]
+            )
+            .rename(
+                columns={
+                    "Amount excl. GST": "Printed Ex GST",
+                    "GST": "Printed GST",
+                    "Amount Incl. GST": "Printed Inc GST"
+                }
+            )
+        )
+
+    else:
+
+        printed = pd.DataFrame(
+            columns=[
+                "Invoice No.",
+                "Customer Code",
+                "Customer",
+                "Printed Ex GST",
+                "Printed GST",
+                "Printed Inc GST"
+            ]
+        )
+
+    if extracted.empty:
+        result = printed.copy()
+
+        if not result.empty:
+            result["Difference Ex GST"] = None
+            result["Difference GST"] = None
+            result["Difference Inc GST"] = None
+            result["Validation"] = "No extracted data"
+
+        return result
+
+    if printed.empty:
+
+        result = extracted.copy()
+
+        result["Printed Ex GST"] = None
+        result["Printed GST"] = None
+        result["Printed Inc GST"] = None
+        result["Difference Ex GST"] = None
+        result["Difference GST"] = None
+        result["Difference Inc GST"] = None
+        result["Validation"] = "No printed customer total"
+
+        return result
+
+    result = pd.merge(
+        extracted,
+        printed[
+            [
+                "Invoice No.",
+                "Customer Code",
+                "Customer",
+                "Printed Ex GST",
+                "Printed GST",
+                "Printed Inc GST"
+            ]
+        ],
+        on=[
+            "Invoice No.",
+            "Customer Code"
+        ],
+        how="outer",
+        suffixes=("_Extracted", "_Printed")
+    )
+
+    # Prefer extracted customer name when available.
+    result["Customer"] = (
+        result["Customer_Extracted"]
+        .fillna(result["Customer_Printed"])
+    )
+
+    result["Difference Ex GST"] = (
+        result["Extracted Ex GST"].fillna(0)
+        - result["Printed Ex GST"].fillna(0)
+    ).round(2)
+
+    result["Difference GST"] = (
+        result["Extracted GST"].fillna(0)
+        - result["Printed GST"].fillna(0)
+    ).round(2)
+
+    result["Difference Inc GST"] = (
+        result["Extracted Inc GST"].fillna(0)
+        - result["Printed Inc GST"].fillna(0)
+    ).round(2)
+
+    tolerance = 0.02
+
+    result["Validation"] = result.apply(
+        lambda row: (
+            "PASS"
+            if (
+                abs(row["Difference Ex GST"]) <= tolerance
+                and abs(row["Difference GST"]) <= tolerance
+                and abs(row["Difference Inc GST"]) <= tolerance
+            )
+            else "FAIL"
+        ),
+        axis=1
+    )
+
+    # Remove duplicate name columns.
+    for col in [
+        "Customer_Extracted",
+        "Customer_Printed"
+    ]:
+        if col in result.columns:
+            result.drop(
+                columns=[col],
+                inplace=True
+            )
+
+    return result
+
+
+# ============================================================
+# EXCEL EXPORT
+# ============================================================
+
+def create_excel(
+    invoice_df,
+    validation_df,
+    customer_totals_df,
+    unmatched_df
+):
+
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl"
+    ) as writer:
+
+        invoice_df.to_excel(
+            writer,
+            sheet_name="Invoice Data",
+            index=False
+        )
+
+        validation_df.to_excel(
+            writer,
+            sheet_name="Validation",
+            index=False
+        )
+
+        customer_totals_df.to_excel(
+            writer,
+            sheet_name="Customer Totals",
+            index=False
+        )
+
+        unmatched_df.to_excel(
+            writer,
+            sheet_name="Unmatched Lines",
+            index=False
+        )
+
+        # ----------------------------------------------------
+        # Formatting
+        # ----------------------------------------------------
+
+        workbook = writer.book
+
+        for sheet_name in workbook.sheetnames:
+
+            worksheet = workbook[sheet_name]
+
+            worksheet.freeze_panes = "A2"
+
+            for column_cells in worksheet.columns:
+
+                max_length = 0
+
+                column_letter = (
+                    column_cells[0].column_letter
+                )
+
+                for cell in column_cells:
+
+                    try:
+                        value_length = len(
+                            str(cell.value)
+                        )
+                    except Exception:
+                        value_length = 0
+
+                    max_length = max(
+                        max_length,
+                        value_length
+                    )
+
+                worksheet.column_dimensions[
+                    column_letter
+                ].width = min(
+                    max(max_length + 2, 12),
+                    45
+                )
+
+    output.seek(0)
+
+    return output.getvalue()
 
 
 # ============================================================
@@ -1234,6 +1852,7 @@ def process_pdf(file_stream):
 
 st.set_page_config(
     page_title="Opal Invoice PDF → Excel",
+    page_icon="📄",
     layout="wide"
 )
 
@@ -1242,7 +1861,8 @@ st.title(
 )
 
 st.caption(
-    "Robust parser for Opal Packaging / Opal Recycling invoice format"
+    "Extracts Opal Packaging / Opal Recycling invoice "
+    "charges, fuel levies and validation totals."
 )
 
 uploaded_file = st.file_uploader(
@@ -1253,6 +1873,8 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
 
+    st.divider()
+
     with st.spinner(
         "Processing Opal invoice PDF... please wait ⏳"
     ):
@@ -1261,189 +1883,293 @@ if uploaded_file:
             uploaded_file.read()
         )
 
-        (
-            df,
-            missed_df,
-            validation_df,
-            invoice_totals,
-            customer_totals
-        ) = process_pdf(
-            file_stream
-        )
+        try:
+
+            (
+                invoice_df,
+                validation_df,
+                customer_totals_df,
+                unmatched_df
+            ) = process_pdf(
+                file_stream
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"❌ Error while processing PDF: {e}"
+            )
+
+            st.exception(e)
+
+            st.stop()
 
     # ========================================================
     # SUMMARY
     # ========================================================
 
-    invoice_count = (
-        df["Invoice No."].nunique()
-        if not df.empty
-        else 0
-    )
+    total_rows = len(invoice_df)
 
-    fuel_count = (
-        int(df["Is Fuel Levy"].sum())
-        if not df.empty
-        else 0
-    )
-
-    st.success(
-        f"✅ Extracted {len(df):,} charge rows "
-        f"from {invoice_count} invoice(s)"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Invoices",
-            invoice_count
-        )
-
-    with col2:
-        st.metric(
-            "Charge Lines",
-            len(df)
-        )
-
-    with col3:
-        st.metric(
-            "Fuel Levy Lines",
-            fuel_count
-        )
-
-    with col4:
-        st.metric(
-            "Unmatched",
-            len(missed_df)
-        )
-
-    # ========================================================
-    # VALIDATION
-    # ========================================================
-
-    st.subheader(
-        "🔎 Invoice Validation"
-    )
-
-    if not validation_df.empty:
-
-        st.dataframe(
-            validation_df,
-            use_container_width=True
-        )
-
-        failed = validation_df[
-            validation_df["Validation"] == "FAIL"
+    main_rows = (
+        invoice_df[
+            invoice_df["Is Fuel Levy"] != True
         ]
+        if not invoice_df.empty
+        else pd.DataFrame()
+    )
 
-        if failed.empty:
+    fuel_rows = (
+        invoice_df[
+            invoice_df["Is Fuel Levy"] == True
+        ]
+        if not invoice_df.empty
+        else pd.DataFrame()
+    )
 
-            st.success(
-                "✅ All invoice totals passed validation."
+    invoice_count = (
+        invoice_df["Invoice No."]
+        .nunique()
+        if not invoice_df.empty
+        else 0
+    )
+
+    validation_pass = (
+        (
+            validation_df["Validation"] == "PASS"
+        ).sum()
+        if not validation_df.empty
+        and "Validation" in validation_df.columns
+        else 0
+    )
+
+    validation_fail = (
+        (
+            validation_df["Validation"] == "FAIL"
+        ).sum()
+        if not validation_df.empty
+        and "Validation" in validation_df.columns
+        else 0
+    )
+
+    unmatched_count = len(
+        unmatched_df
+    )
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    col1.metric(
+        "Invoices",
+        invoice_count
+    )
+
+    col2.metric(
+        "Main Charges",
+        len(main_rows)
+    )
+
+    col3.metric(
+        "Fuel Levy Lines",
+        len(fuel_rows)
+    )
+
+    col4.metric(
+        "Validation PASS",
+        validation_pass
+    )
+
+    col5.metric(
+        "Unmatched",
+        unmatched_count
+    )
+
+    # ========================================================
+    # VALIDATION STATUS
+    # ========================================================
+
+    st.divider()
+
+    if validation_fail == 0 and validation_pass > 0:
+
+        st.success(
+            f"✅ All {validation_pass} invoice(s) "
+            "passed validation."
+        )
+
+    elif validation_fail > 0:
+
+        st.error(
+            f"⚠️ {validation_fail} invoice(s) "
+            "failed validation."
+        )
+
+    else:
+
+        st.warning(
+            "⚠️ No invoice validation records were found."
+        )
+
+    # ========================================================
+    # TABS
+    # ========================================================
+
+    (
+        tab1,
+        tab2,
+        tab3,
+        tab4
+    ) = st.tabs(
+        [
+            "📄 Invoice Data",
+            "✅ Validation",
+            "🏢 Customer Totals",
+            "⚠️ Unmatched Lines"
+        ]
+    )
+
+    # ========================================================
+    # TAB 1
+    # ========================================================
+
+    with tab1:
+
+        st.subheader(
+            "Extracted Invoice Data"
+        )
+
+        if not invoice_df.empty:
+
+            st.dataframe(
+                invoice_df,
+                use_container_width=True,
+                height=600
             )
 
         else:
 
-            st.error(
-                f"⚠️ {len(failed)} invoice(s) failed validation."
+            st.warning(
+                "No invoice lines were extracted."
             )
 
     # ========================================================
-    # EXTRACTED DATA
+    # TAB 2
     # ========================================================
 
-    st.subheader(
-        "📋 Extracted Charge Lines"
-    )
-
-    if not df.empty:
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            height=600
-        )
-
-    # ========================================================
-    # UNMATCHED
-    # ========================================================
-
-    if not missed_df.empty:
+    with tab2:
 
         st.subheader(
-            "⚠️ Unmatched / Review Lines"
+            "Invoice Validation"
         )
-
-        st.warning(
-            f"{len(missed_df)} lines require review."
-        )
-
-        st.dataframe(
-            missed_df,
-            use_container_width=True,
-            height=400
-        )
-
-    # ========================================================
-    # EXCEL EXPORT
-    # ========================================================
-
-    output = io.BytesIO()
-
-    with pd.ExcelWriter(
-        output,
-        engine="openpyxl"
-    ) as writer:
-
-        if not df.empty:
-
-            df.to_excel(
-                writer,
-                sheet_name="Invoice Data",
-                index=False
-            )
 
         if not validation_df.empty:
 
-            validation_df.to_excel(
-                writer,
-                sheet_name="Validation",
-                index=False
+            st.dataframe(
+                validation_df,
+                use_container_width=True
             )
 
-        if not missed_df.empty:
+        else:
 
-            missed_df.to_excel(
-                writer,
-                sheet_name="Unmatched Lines",
-                index=False
+            st.info(
+                "No validation data available."
             )
 
-        if customer_totals:
+    # ========================================================
+    # TAB 3
+    # ========================================================
 
-            customer_validation_df = pd.DataFrame(
-                customer_totals.values()
+    with tab3:
+
+        st.subheader(
+            "Customer / Site Validation"
+        )
+
+        if not customer_totals_df.empty:
+
+            st.dataframe(
+                customer_totals_df,
+                use_container_width=True,
+                height=600
             )
 
-            customer_validation_df.to_excel(
-                writer,
-                sheet_name="Customer Totals",
-                index=False
+        else:
+
+            st.info(
+                "No customer totals were found."
             )
+
+    # ========================================================
+    # TAB 4
+    # ========================================================
+
+    with tab4:
+
+        st.subheader(
+            "Unmatched / Review Lines"
+        )
+
+        if not unmatched_df.empty:
+
+            st.warning(
+                f"{len(unmatched_df)} line(s) require review."
+            )
+
+            st.dataframe(
+                unmatched_df,
+                use_container_width=True,
+                height=600
+            )
+
+        else:
+
+            st.success(
+                "✅ No unmatched invoice lines."
+            )
+
+    # ========================================================
+    # DOWNLOAD
+    # ========================================================
+
+    st.divider()
+
+    excel_bytes = create_excel(
+        invoice_df,
+        validation_df,
+        customer_totals_df,
+        unmatched_df
+    )
+
+    invoice_numbers = (
+        invoice_df["Invoice No."]
+        .dropna()
+        .astype(str)
+        .unique()
+        if not invoice_df.empty
+        else []
+    )
+
+    if len(invoice_numbers) == 1:
+
+        file_name = (
+            f"Opal_Invoice_"
+            f"{invoice_numbers[0]}.xlsx"
+        )
+
+    else:
+
+        file_name = (
+            "Opal_Invoice_Extract.xlsx"
+        )
 
     st.download_button(
-
         label="📥 Download Excel",
-
-        data=output.getvalue(),
-
-        file_name=(
-            "Opal_Invoice_Extract.xlsx"
-        ),
-
+        data=excel_bytes,
+        file_name=file_name,
         mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
+            "application/vnd.openxmlformats-"
+            "officedocument.spreadsheetml.sheet"
         )
     )
