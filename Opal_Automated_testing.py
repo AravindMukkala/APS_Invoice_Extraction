@@ -620,7 +620,9 @@ def build_template(invoice_df):
 
     out = pd.DataFrame({
         "Invoice No.": invoice_df["Invoice No."].astype(str),
-        "Customer": invoice_df["Customer"],
+        # "Customer Code - Customer", e.g. "R-ALB3003 - Albert Park Golf Maintenance"
+        "Customer": (invoice_df["Customer Code"].fillna("").astype(str)
+                     + " - " + invoice_df["Customer"].fillna("").astype(str)),
         "Date": invoice_df["Date"],
         "Description": invoice_df["Description"],
         "Charge Type/Period Reference": invoice_df.apply(charge_or_period, axis=1),
