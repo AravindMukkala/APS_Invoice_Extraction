@@ -585,6 +585,14 @@ def create_excel(sheets):
             df.to_excel(writer, sheet_name=name, index=False)
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"
+            headers = [c.value for c in ws[1]]
+            for col_idx, header in enumerate(headers, start=1):
+                if header in ("Reference", "Invoice No."):
+                    for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+                        row[0].number_format = "@"
+                elif header in ("Amount excl. GST", "GST", "Item Total"):
+                    for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+                        row[0].number_format = "0.00"
             for column_cells in ws.columns:
                 width = max(len(str(c.value)) if c.value is not None else 0
                             for c in column_cells)
@@ -593,10 +601,46 @@ def create_excel(sheets):
     return output.getvalue()
 
 
+TEMPLATE_COLUMNS = [
+    "Invoice No.", "Customer", "Date", "Description",
+    "Charge Type/Period Reference", "Reference", "Billed qty", "Qty.",
+    "Unit Price", "Amount excl. GST", "GST", "Amount Incl. GST",
+]
+
+
+def build_template(invoice_df):
+    """Invoice Data reshaped to the paste-in template's columns and order."""
+    def charge_or_period(r):
+        if r["Charge Type"] == "Period Charge" and r["Period From"]:
+            return join(r["Period From"], "to", r["Period To"])
+        return r["Charge Type"]
+
+    def inc_aud(v):
+        return "" if v is None or pd.isna(v) else f"{v:,.2f} AUD"
+
+    out = pd.DataFrame({
+        "Invoice No.": invoice_df["Invoice No."].astype(str),
+        "Customer": invoice_df["Customer"],
+        "Date": invoice_df["Date"],
+        "Description": invoice_df["Description"],
+        "Charge Type/Period Reference": invoice_df.apply(charge_or_period, axis=1),
+        # Kept as text so Excel doesn't turn 50001003546705 into 5.0E+13.
+        "Reference": invoice_df["Reference"].astype(str),
+        "Billed qty": invoice_df["Billed qty"],
+        "Qty.": invoice_df["Qty."],
+        "Unit Price": invoice_df["Unit Price"].fillna(""),
+        "Amount excl. GST": invoice_df["Amount excl. GST"],
+        "GST": invoice_df["GST"],
+        "Amount Incl. GST": invoice_df["Amount Incl. GST"].map(inc_aud),
+    })
+    return out[TEMPLATE_COLUMNS]
+
+
 def extract_all(file_stream):
     invoice_df, inv_val, cust_val, sub_val, unmatched = process_pdf(file_stream)
     return {
         "Invoice Data": invoice_df,
+        "Copy to Template": build_template(invoice_df),
         "Invoice Validation": inv_val,
         "Customer Validation": cust_val,
         "Sub-Total Validation": sub_val,
