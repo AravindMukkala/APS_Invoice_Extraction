@@ -404,6 +404,16 @@ def to_excel_bytes(result: ParseResult) -> bytes:
         reconcile(result).to_excel(xw, sheet_name="Invoice Info", index=False,
                                    startrow=len(info) + 2)
 
+        # Preserve every source row that could not be confidently parsed.
+        pd.DataFrame(
+            {"Extraction exception": result.unmatched}
+        ).to_excel(xw, sheet_name="Extraction Exceptions", index=False)
+
+        # Keep validation warnings available in the workbook.
+        pd.DataFrame(
+            {"Row requiring review": result.flagged}
+        ).to_excel(xw, sheet_name="Row Review", index=False)
+
         _format_workbook(xw.book)
     return buf.getvalue()
 
@@ -496,8 +506,16 @@ for f in files:
         with st.expander(f"⚠️ {len(res.flagged)} row(s) flagged for review", expanded=True):
             st.code("\n".join(res.flagged))
     if res.unmatched:
-        with st.expander(f"⚠️ {len(res.unmatched)} row(s) could not be parsed"):
-            st.code("\n".join(res.unmatched))
+        st.error(
+            f"⛔ {len(res.unmatched)} source row(s) could not be parsed. "
+            "They are included in the Extraction Exceptions Excel tab. "
+            "Do not treat this extraction as complete."
+        )
+        with st.expander(
+            f"⚠️ {len(res.unmatched)} row(s) could not be parsed",
+            expanded=True,
+        ):
+            st.code("\\n".join(res.unmatched))
 
     df = res.items.drop(columns=["Page"])
     fc1, fc2, fc3 = st.columns(3)
