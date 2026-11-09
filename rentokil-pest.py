@@ -37,7 +37,7 @@ ROW_RE = re.compile(
     rf"""^
     (?P<contract>\d{{8}})\s+
     (?P<pink>\d+)\s+
-    (?P<middle>.+?)\s+
+    (?P<middle>.+)\s+          # greedy: premises names can contain 'VIC 3110'
     (?P<state>{STATES})\s+
     (?P<pc>\d{{3,4}})\s+
     (?P<pn>\d+)\s+
@@ -81,6 +81,7 @@ class ParseResult:
     items: pd.DataFrame
     totals: dict
     unmatched: list = field(default_factory=list)
+    flagged: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +120,11 @@ def _split_middle_by_position(row_chars, bounds):
             prev = c
         out[name] = re.sub(r"\s+", " ", txt).strip()
     return out
+
+
+def _cell_text(row_chars, lo, hi):
+    return "".join(c["text"] for c in sorted(row_chars, key=lambda c: c["x0"])
+                   if lo <= c["x0"] + 0.5 < hi)
 
 
 # Fallback: regex-only split. Address normally starts with a number, "UNIT", "LOT"
@@ -161,6 +167,7 @@ def parse_invoice(pdf_source) -> ParseResult:
     unmatched: list[str] = []
     totals: dict = {}
     accounts: list[str] = []
+    flagged: list[str] = []
 
     with pdfplumber.open(pdf_source) as pdf:
         for page_no, page in enumerate(pdf.pages, start=1):
@@ -210,6 +217,17 @@ def parse_invoice(pdf_source) -> ParseResult:
                     "Annual Value (Excl. GST)": to_num(m["annual"]),
                     "Monthly Value (Excl. GST)": to_num(m["monthly"]),
                 })
+                issues = []
+                if m["pink"] != m["pn"]:
+                    issues.append("PN != Pink No. (columns may be shifted)")
+                if bounds and m["state"].upper() not in re.findall(
+                        rf"\b(?:{STATES})\b", _cell_text(row_chars, bounds[3], _vertical_lines(page)[6]).upper()):
+                    issues.append("State column mismatch")
+                if abs(to_num(m["annual"]) / 12 - to_num(m["monthly"])) > 0.05:
+                    issues.append("Monthly != Annual/12")
+                if issues:
+                    flagged.append(f"p{page_no} contract {m['contract']} pink {m['pink']}: "
+                                   + "; ".join(issues) + f"  |  {line}")
 
             # Totals appear on the last detail page under the table.
             t = TOTALS_RE.findall(text)
@@ -227,7 +245,7 @@ def parse_invoice(pdf_source) -> ParseResult:
         if len(accounts) > 1:
             header["Account # (detail pages)"] = ", ".join(accounts[1:])
     df = pd.DataFrame(rows, columns=["Page"] + COLUMNS)
-    return ParseResult(header=header, items=df, totals=totals, unmatched=unmatched)
+    return ParseResult(header=header, items=df, totals=totals, unmatched=unmatched, flagged=flagged)
 
 
 def reconcile(result: ParseResult) -> pd.DataFrame:
@@ -257,6 +275,11 @@ def reconcile(result: ParseResult) -> pd.DataFrame:
             "Difference": round(calc_total - total, 2),
             "OK": abs(calc_total - total) < 0.05,
         })
+    checks.append({
+        "Check": "Row-level column checks",
+        "Extracted sum": len(result.flagged), "Invoice stated": None, "Difference": None,
+        "OK": len(result.flagged) == 0,
+    })
     checks.append({
         "Check": "Line items extracted",
         "Extracted sum": len(df), "Invoice stated": None, "Difference": None,
@@ -375,6 +398,9 @@ for f in files:
     with st.expander("Reconciliation & invoice details"):
         st.dataframe(checks, hide_index=True, use_container_width=True)
         st.json(h | res.totals)
+    if res.flagged:
+        with st.expander(f"⚠️ {len(res.flagged)} row(s) flagged for review", expanded=True):
+            st.code("\n".join(res.flagged))
     if res.unmatched:
         with st.expander(f"⚠️ {len(res.unmatched)} row(s) could not be parsed"):
             st.code("\n".join(res.unmatched))
