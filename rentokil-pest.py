@@ -28,7 +28,7 @@ import pdfplumber
 # --------------------------------------------------------------------------- #
 # Regex patterns
 # --------------------------------------------------------------------------- #
-MONEY = r"\$?-?[\d,]+\.\d{2}"
+MONEY = r"(?:-?\$?-?[\d,]+\.\d{2}|\(\$?[\d,]+\.\d{2}\))"   # 1,234.56  $-9.95  -$9.95  ($155.16)
 STATES = r"NSW|VIC|QLD|SA|WA|TAS|NT|ACT"
 
 # One invoice line item. Everything between Pink No. and State is "middle"
@@ -41,12 +41,12 @@ ROW_RE = re.compile(
     (?P<state>{STATES})\s+
     (?P<pc>\d{{3,4}})\s+
     (?P<pn>\d+)\s+
-    (?P<code>[A-Z][A-Z0-9]{{1,9}})\s+
+    (?P<code>[A-Z0-9][A-Z0-9-]{{1,9}})   # PPS, CPNTMU, 568400...\s+
     (?P<desc>.+?)\s+
     (?P<branch>\d+)\s+
     (?P<qty>\d+)\s+
     (?P<freq>\d+)\s+
-    (?P<annual>{MONEY})\s+
+    (?:(?P<annual>{MONEY})\s+)?
     (?P<monthly>{MONEY})
     \s*$""",
     re.VERBOSE | re.IGNORECASE,
@@ -72,7 +72,11 @@ COLUMNS = [
 
 
 def to_num(s: str) -> float:
-    return float(s.replace("$", "").replace(",", ""))
+    """'$1,234.56' -> 1234.56 ; '-$9.95' / '($9.95)' -> -9.95 (credits)."""
+    s = s.strip()
+    neg = s.startswith("(") or "-" in s
+    val = float(re.sub(r"[^\d.]", "", s))
+    return -val if neg else val
 
 
 @dataclass
@@ -155,6 +159,108 @@ def _group_words_by_line(page, tol=2.0):
 
 
 # --------------------------------------------------------------------------- #
+# Row extraction: grid cells (preferred) or regex on the text line (fallback)
+# --------------------------------------------------------------------------- #
+CONTRACT_START_RE = re.compile(r"^\d{8}\s")
+CELL_RES = {   # regex each grid cell must satisfy
+    "Contract No.": re.compile(r"^\d{8}$"),
+    "Pink No.": re.compile(r"^\d+$"),
+    "State": re.compile(rf"^(?:{STATES})$", re.I),
+    "PC": re.compile(r"^\d{3,4}$"),
+    "PN": re.compile(r"^\d+$"),
+    "Product Code": re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$", re.I),
+    "Service Branch": re.compile(r"^\d+$"),
+    "Qty": re.compile(r"^\d+$"),
+    "Freq": re.compile(r"^\d+$"),
+    "Annual Value (Excl. GST)": re.compile(rf"^(?:{MONEY})?$"),   # blank on grouped lines
+    "Monthly Value (Excl. GST)": re.compile(rf"^{MONEY}$"),
+}
+HARD_FIELDS = ("Contract No.", "Pink No.", "Monthly Value (Excl. GST)")
+INT_FIELDS = ("Pink No.", "PN", "Service Branch", "Qty", "Freq")
+
+
+def _row_cells(row_chars, vlines):
+    """Read every grid cell of one row from character positions."""
+    cells = {}
+    for i, name in enumerate(COLUMNS):
+        lo, hi = vlines[i], vlines[i + 1]
+        chars = sorted((c for c in row_chars if lo <= c["x0"] + 0.5 < hi),
+                       key=lambda c: c["x0"])
+        txt, prev = "", None
+        for c in chars:
+            if prev is not None and c["x0"] - prev["x1"] > 1.0:
+                txt += " "
+            txt += c["text"]
+            prev = c
+        cells[name] = re.sub(r"\s+", " ", txt).strip()
+    return cells
+
+
+def _row_cells_regex(line):
+    m = ROW_RE.match(line)
+    if not m:
+        return None
+    return {
+        "Contract No.": m["contract"], "Pink No.": m["pink"],
+        **_split_middle_by_regex(m["middle"]),
+        "State": m["state"], "PC": m["pc"], "PN": m["pn"], "Product Code": m["code"],
+        "Product Description": m["desc"], "Service Branch": m["branch"],
+        "Qty": m["qty"], "Freq": m["freq"],
+        "Annual Value (Excl. GST)": m["annual"] or "",
+        "Monthly Value (Excl. GST)": m["monthly"],
+    }
+
+
+# Australian postcode ranges -> state (used only when the State cell is unusable)
+POSTCODE_STATES = [
+    ("ACT", 200, 299), ("NT", 800, 999), ("NSW", 1000, 2599), ("ACT", 2600, 2618),
+    ("NSW", 2619, 2899), ("ACT", 2900, 2920), ("NSW", 2921, 2999), ("VIC", 3000, 3999),
+    ("QLD", 4000, 4999), ("SA", 5000, 5999), ("WA", 6000, 6999), ("TAS", 7000, 7999),
+    ("VIC", 8000, 8999), ("QLD", 9000, 9999),
+]
+
+
+def state_from_postcode(pc: str):
+    if not pc.isdigit():
+        return None
+    n = int(pc)
+    return next((st for st, lo, hi in POSTCODE_STATES if lo <= n <= hi), None)
+
+
+def _validate_row(cells):
+    """Regex-check each cell. Returns (row, issues); row is None if unusable."""
+    issues = []
+    for name, rx in CELL_RES.items():
+        if not rx.match(cells.get(name, "")):
+            if name in HARD_FIELDS:
+                return None, [f"bad {name}: '{cells.get(name, '')}'"]
+            issues.append(f"{name} = '{cells.get(name, '')}' looks wrong")
+    row = dict(cells)
+    for k in INT_FIELDS:
+        row[k] = int(row[k]) if row[k].isdigit() else None
+    row["State"] = row["State"].upper()
+    if not CELL_RES["State"].match(row["State"]):
+        guess = state_from_postcode(row["PC"])
+        if guess:
+            issues = [i for i in issues if not i.startswith("State ")]
+            issues.append(f"State '{cells['State']}' invalid -> set to {guess} from postcode")
+            row["State"] = guess
+    if row["PC"].isdigit():
+        row["PC"] = row["PC"].zfill(4)
+    annual = cells["Annual Value (Excl. GST)"]
+    row["Annual Value (Excl. GST)"] = to_num(annual) if annual else None
+    row["Monthly Value (Excl. GST)"] = to_num(cells["Monthly Value (Excl. GST)"])
+    if row["PN"] is not None and row["PN"] != row["Pink No."]:
+        issues.append("PN != Pink No.")
+    a, mth = row["Annual Value (Excl. GST)"], row["Monthly Value (Excl. GST)"]
+    if a and abs(a / 12 - mth) > 0.05:
+        issues.append(f"Monthly {mth:,.2f} != Annual/12 ({a / 12:,.2f})")
+    elif a == 0 and mth:
+        issues.append("Annual value is $0.00")
+    return row, issues
+
+
+# --------------------------------------------------------------------------- #
 # Main parser
 # --------------------------------------------------------------------------- #
 def parse_invoice(pdf_source) -> ParseResult:
@@ -183,51 +289,34 @@ def parse_invoice(pdf_source) -> ParseResult:
                     if m:
                         header[key] = m.group(1).strip()
 
-            bounds = _middle_bounds(page)
+            vlines = _vertical_lines(page)
+            grid = len(vlines) == len(COLUMNS) + 1   # 15 columns -> 16 vertical lines
 
             for words in _group_words_by_line(page):
                 line = " ".join(w["text"] for w in words)
-                m = ROW_RE.match(line)
-                if not m:
-                    if re.match(r"^\d{8}\s", line):  # looks like a row but didn't match
-                        unmatched.append(f"p{page_no}: {line}")
-                    continue
+                if not CONTRACT_START_RE.match(line):
+                    continue                      # header, footer, totals...
 
-                if bounds:
-                    top, bottom = min(w["top"] for w in words), max(w["bottom"] for w in words)
+                if grid:
+                    top = min(w["top"] for w in words)
+                    bottom = max(w["bottom"] for w in words)
                     row_chars = [c for c in page.chars
                                  if c["top"] >= top - 1 and c["bottom"] <= bottom + 1]
-                    middle = _split_middle_by_position(row_chars, bounds)
+                    cells = _row_cells(row_chars, vlines)
                 else:
-                    middle = _split_middle_by_regex(m["middle"])
+                    cells = _row_cells_regex(line)
+                    if cells is None:
+                        unmatched.append(f"p{page_no}: {line}")
+                        continue
 
-                rows.append({
-                    "Page": page_no,
-                    "Contract No.": m["contract"],
-                    "Pink No.": int(m["pink"]),
-                    **middle,
-                    "State": m["state"].upper(),
-                    "PC": m["pc"].zfill(4),
-                    "PN": int(m["pn"]),
-                    "Product Code": m["code"],
-                    "Product Description": m["desc"].strip(),
-                    "Service Branch": int(m["branch"]),
-                    "Qty": int(m["qty"]),
-                    "Freq": int(m["freq"]),
-                    "Annual Value (Excl. GST)": to_num(m["annual"]),
-                    "Monthly Value (Excl. GST)": to_num(m["monthly"]),
-                })
-                issues = []
-                if m["pink"] != m["pn"]:
-                    issues.append("PN != Pink No. (columns may be shifted)")
-                if bounds and m["state"].upper() not in re.findall(
-                        rf"\b(?:{STATES})\b", _cell_text(row_chars, bounds[3], _vertical_lines(page)[6]).upper()):
-                    issues.append("State column mismatch")
-                if abs(to_num(m["annual"]) / 12 - to_num(m["monthly"])) > 0.05:
-                    issues.append("Monthly != Annual/12")
+                row, issues = _validate_row(cells)
+                if row is None:                    # contract/money cells failed regex
+                    unmatched.append(f"p{page_no}: {line}  ({'; '.join(issues)})")
+                    continue
+                rows.append({"Page": page_no, **row})
                 if issues:
-                    flagged.append(f"p{page_no} contract {m['contract']} pink {m['pink']}: "
-                                   + "; ".join(issues) + f"  |  {line}")
+                    flagged.append(f"p{page_no} contract {row['Contract No.']} pink "
+                                   f"{row['Pink No.']}: " + "; ".join(issues) + f"  |  {line}")
 
             # Totals appear on the last detail page under the table.
             t = TOTALS_RE.findall(text)
@@ -276,7 +365,7 @@ def reconcile(result: ParseResult) -> pd.DataFrame:
             "OK": abs(calc_total - total) < 0.05,
         })
     checks.append({
-        "Check": "Row-level column checks",
+        "Check": "Rows flagged for review",
         "Extracted sum": len(result.flagged), "Invoice stated": None, "Difference": None,
         "OK": len(result.flagged) == 0,
     })
@@ -391,11 +480,16 @@ for f in files:
     c5.metric("Total payable", f"${res.totals.get('Total Payable (Incl. GST)', 0):,.2f}")
 
     checks = reconcile(res)
-    if checks["OK"].all():
-        st.success("✅ Extracted line items reconcile with the invoice totals.")
+    totals_ok = checks.loc[checks["Check"] != "Rows flagged for review", "OK"].all()
+    if not totals_ok:
+        st.error("❌ Totals do NOT reconcile — some lines were missed or misread. "
+                 "Do not use this file without checking.")
+    elif res.flagged:
+        st.warning(f"✅ Totals reconcile to the cent, but {len(res.flagged)} row(s) have "
+                   "data issues in the PDF itself — see the flagged list below.")
     else:
-        st.error("⚠️ Reconciliation mismatch — review before using the file.")
-    with st.expander("Reconciliation & invoice details"):
+        st.success("✅ All line items reconcile with the invoice totals.")
+    with st.expander("Reconciliation & invoice details", expanded=not totals_ok):
         st.dataframe(checks, hide_index=True, use_container_width=True)
         st.json(h | res.totals)
     if res.flagged:
